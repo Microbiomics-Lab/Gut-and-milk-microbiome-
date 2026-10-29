@@ -1,0 +1,920 @@
+---
+title: "03 - Statistical Models"
+author: "Esteven Aragón"
+date: "2025-09-27"
+output:
+  word_document:
+    toc: true
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+
+fig_dir = Sys.getenv("PIPELINE_FIGDIR", unset = "")
+
+if (nzchar(fig_dir)) {
+  fig_path_knitr = paste0(normalizePath(fig_dir, winslash = "/", mustWork = FALSE), "/")
+  
+  dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+  knitr::opts_chunk$set(
+    fig.path = fig_path_knitr,
+    dev = "png",
+    dpi = 300
+  )
+}
+```
+
+# 1. Configuración
+
+## 1.1 Librerías
+
+```{r libraries, include=FALSE}
+pacman::p_load(
+  rmarkdown, knitr,
+  gt, patchwork, scales, ggplot2,
+  lme4, lmerTest, car, emmeans,
+  umap, cluster, rpca, HSC, DirichletMultinomial, sparcl,
+  vegan, zCompositions, phyloseq, microbiome,
+  rlang, stringr, tidyr, purrr, tibble, dplyr,
+  Maaslin2
+)
+```
+
+## 1.2 Carga de objetos limpios
+
+```{r load_objects, include=FALSE}
+gen_path  = getwd()
+gen_path  = gsub("notebooks", "", gen_path)
+data_path = paste0(gen_path, "Data")
+proc_path = paste0(data_path, "/processed")
+
+# Objetos phyloseq
+HMilkclean_filtered = readRDS(paste0(proc_path, "/HMilkclean_filtered.rds"))
+
+# Metadatos
+metadata = readRDS(paste0(proc_path, "/metadata_clean.rds"))
+df = readRDS(paste0(proc_path, "/df_clean.rds"))
+
+cat("Objetos cargados correctamente.\n")
+cat("Muestras:", nsamples(HMilkclean_filtered), "\n")
+cat("Individuos:", length(unique(df$p_code)), "\n")
+```
+
+# 2. Modelo Lineal Mixto Generalizado (GLMM)
+
+## 2.1 Formulación
+
+De acuerdo con la literatura pediátrica, el desarrollo infantil durante
+el primer año de vida presenta un comportamiento de crecimiento
+exponencial rápido. Se implementó un GLMM con función de enlace
+logarítmico y distribución Gamma.
+
+Sea $Y_{ij}$ el índice de crecimiento observado para el paciente $i$ en
+el tiempo $j$:
+
+$$Y_{ij} | u_i \sim \text{Gamma}(\mu_{ij},\nu)$$
+
+$$\log(\mu_{ij}) = \beta_0 + \beta_1 \text{Parto}_i + \beta_2 \text{Tiempo}_j + u_i$$
+
+$$u_i \sim N(0, \sigma^2_u)$$
+
+**Parámetros:**
+
+- $\beta_0$: Intercepto fijo.
+- $\beta_1$: Efecto fijo del tipo de nacimiento (Cesárea vs. Vaginal).
+- $\beta_2$: Efecto fijo de la etapa de medición (I, II, III).
+- $u_i$: Efecto aleatorio (intercepto) específico para el paciente $i$.
+
+## 2.2 Ajuste del modelo
+
+```{r glmm_fit, include=FALSE}
+df$p_code = as.factor(df$p_code)
+df$b_type = as.factor(df$b_type)
+
+df = df %>%
+  mutate(
+    t_time = case_when(
+      samp_n == 1 ~ "I",
+      samp_n == 2 ~ "II",
+      samp_n == 3 ~ "III"
+    )
+  )
+df$t_time = factor(df$t_time, levels = c("I", "II", "III"))
+
+mod1_glmm = glmer(
+  g_index ~ t_time + b_type + (1 | p_code),
+  data = df,
+  family = Gamma(link = "log")
+)
+```
+
+## 2.3 Resultados
+
+Los resultados del análisis de devianza confirmaron que el tiempo de
+medición tiene un efecto principal altamente significativo sobre el
+índice de crecimiento ($\chi^2 = 518.73$, $p < 0.001$). El tipo de
+nacimiento no mostró un impacto estadísticamente significativo
+($p = 0.760$).
+
+```{r glmm_anova, include=FALSE}
+anova_glmm = car::Anova(mod1_glmm)
+```
+
+```{r}
+anova_glmm
+```
+
+## 2.4 Estimaciones marginales
+
+```{r glmm_emmeans, include=FALSE}
+emmeans_res = emmeans(mod1_glmm, pairwise ~ t_time, type = "response")
+```
+
+```{r}
+emmeans_res
+```
+
+Al evaluar las estimaciones marginales, se evidenció un incremento
+progresivo del índice promedio: 9.23 (T1) -> 11.15 (T2) -> 12.19 (T3).
+El crecimiento es estadísticamente significativo en cada transición
+temporal ($p < 0.001$).
+
+# 3. Clustering PAM (Bray-Curtis)
+
+## 3.1 Preparación de datos
+
+Se calcula la abundancia relativa y se organizan los datos por tipo de
+muestra y tiempo:
+
+```{r prep_clustering, include=FALSE}
+ps_relative = transform_sample_counts(HMilkclean_filtered, function(x) x / sum(x))
+
+df_ps = as.data.frame(otu_table(ps_relative))
+taxa_info = as.data.frame(tax_table(ps_relative))
+
+taxa_genus = taxa_info$Genus
+taxa_genus[is.na(taxa_genus)] = "unclassified"
+row.names(df_ps) = make.unique(as.character(taxa_genus))
+
+asv_df_T = as.data.frame(t(df_ps))
+asv_df_T[] = lapply(asv_df_T, function(x) as.numeric(as.character(x)))
+
+asv_df_genus = asv_df_T %>%
+  rownames_to_column(var = "sam_id") %>%
+  mutate(
+    sample_type = case_when(
+      startsWith(sam_id, "MH") ~ "Stool",
+      startsWith(sam_id, "ML") ~ "Milk",
+      TRUE ~ "Other"
+    ),
+    time = case_when(
+      endsWith(sam_id, "-I")   ~ "I",
+      endsWith(sam_id, "-II")  ~ "II",
+      endsWith(sam_id, "-III") ~ "III"
+    ),
+    time = factor(time, levels = c("I", "II", "III"))
+  )
+
+cluster_by_time_type = split(
+  asv_df_genus,
+  f = list(asv_df_genus$sample_type, asv_df_genus$time),
+  sep = "_"
+)
+cluster_by_time_type = cluster_by_time_type[sapply(cluster_by_time_type, nrow) > 0]
+type_of_cluster_to_graph = names(cluster_by_time_type)
+```
+
+## 3.2 Fórmulas
+
+La abundancia relativa del taxón $j$ en la muestra $i$:
+
+$$x'_{ij} = \frac{x_{ij}}{\sum_{j} x_{ij}}$$
+
+La disimilitud de Bray-Curtis entre muestras $i$ y $k$ (con valores
+estandarizados que suman 1):
+
+$$BC_{ik} = \frac{\sum_{j} |x'_{ij} - x'_{kj}|}{2}$$
+
+## 3.3 Índice de silueta (k = 2–10)
+
+```{r pam_silhouette, include=FALSE}
+silhouette_plots = list()
+
+for (group_name in type_of_cluster_to_graph) {
+  current_df = cluster_by_time_type[[group_name]]
+  asv_numeric = current_df %>% select(-sam_id, -sample_type, -time)
+  
+  asv_numeric[] = lapply(asv_numeric, as.numeric)
+  asv_numeric[is.na(asv_numeric)] = 0
+  asv_numeric = asv_numeric[rowSums(asv_numeric) > 0, ]
+  asv_numeric = asv_numeric[, colSums(asv_numeric) > 0]
+  
+  if (nrow(asv_numeric) < 4) next
+  
+  bray_dist_matrix = vegdist(asv_numeric, method = "bray")
+  
+  silhouette_scores = rep(NA, 10)
+  for (k in 2:10) {
+    if (k >= nrow(asv_numeric)) break
+    pam_result = pam(bray_dist_matrix, k = k)
+    silhouette_scores[k] = pam_result$silinfo$avg.width
+  }
+  
+  plot_data = data.frame(k = 2:10, score = silhouette_scores[2:10])
+  plot_data = plot_data[!is.na(plot_data$score), ]
+  
+  silhouette_plots[[group_name]] =
+    ggplot(plot_data, aes(x = k, y = score)) +
+      geom_hline(yintercept = 0.70, linetype = "dashed", color = "#4CAF50", linewidth = 0.8, alpha = 0.6) +
+      geom_hline(yintercept = 0.50, linetype = "dashed", color = "#FF9800", linewidth = 0.8, alpha = 0.6) +
+      geom_hline(yintercept = 0.25, linetype = "dashed", color = "#F44336", linewidth = 0.8, alpha = 0.6) +
+      geom_line(color = "#0073C2", linewidth = 1) +
+      geom_point(color = "#0073C2", size = 3) +
+      annotate("text", x = 10, y = 0.85, label = "Strong (Very Good)", color = "#4CAF50", hjust = 1, fontface = "bold", size = 3.5) +
+      annotate("text", x = 10, y = 0.60, label = "Reasonable (Good)", color = "#FF9800", hjust = 1, fontface = "bold", size = 3.5) +
+      annotate("text", x = 10, y = 0.37, label = "Weak (Regular)", color = "#F44336", hjust = 1, fontface = "bold", size = 3.5) +
+      annotate("text", x = 10, y = 0.12, label = "Without Structure (Deficient)", color = "grey50", hjust = 1, fontface = "bold", size = 3.5) +
+      labs(
+        title = paste("Average Silhouette Score -", group_name),
+        x = "Number of Clusters (k)",
+        y = "Average Silhouette Score"
+      ) +
+      scale_x_continuous(limits = c(2, 10), breaks = 2:10) +
+      scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+      theme_minimal() +
+      theme(panel.grid.minor = element_blank())
+}
+```
+
+Los valores de silueta se mantienen por debajo del umbral de 0.50 para
+todos los $k$ evaluados, y en la mayoría de los puntos no superan 0.25.
+**No hay estructura de agrupamiento conformada.**
+
+**Figura 1:** *Índice de silueta en leche materna (T1, T2, T3)*
+
+```{r, fig.width=10, fig.height=12}
+#| label: fig-sil-leche
+#| fig-cap: "Evaluación de la estructura de agrupamiento por índice de silueta en la leche materna."
+
+(silhouette_plots[['Milk_I']] / silhouette_plots[['Milk_II']] / silhouette_plots[['Milk_III']])
+```
+
+**Figura 2:** *Índice de silueta en heces del infante (T1, T2, T3)*
+
+```{r, fig.width=10, fig.height=12}
+#| label: fig-sil-heces
+#| fig-cap: "Evaluación de la estructura de agrupamiento por índice de silueta en heces del infante."
+
+(silhouette_plots[['Stool_I']] / silhouette_plots[['Stool_II']] / silhouette_plots[['Stool_III']])
+```
+
+# 4. Transformación CLR y Clustering
+
+## 4.1 Imputación de ceros y transformación CLR
+
+```{r clr_process, include=FALSE}
+imputar_ceros_bayes = function(physeq_obj) {
+  otu_mat = as(otu_table(physeq_obj), "matrix")
+  if (taxa_are_rows(physeq_obj)) otu_mat = t(otu_mat)
+  
+  otu_imputed = cmultRepl(otu_mat, method = "CZM", label = 0,
+                          output = "p-counts", suppress.print = TRUE)
+  
+  if (taxa_are_rows(physeq_obj)) otu_imputed = t(otu_imputed)
+  
+  otu_table(physeq_obj) = otu_table(otu_imputed, taxa_are_rows = taxa_are_rows(physeq_obj))
+  return(physeq_obj)
+}
+
+process_to_clr = function(physeq_subset, tipo_muestra, prev_threshold = 0.10) {
+  physeq_glom = tax_glom(physeq_subset, taxrank = "Genus", NArm = FALSE)
+  physeq_limpio = filter_taxa(physeq_glom, function(x) sum(x > 0) > (prev_threshold * length(x)), TRUE)
+  physeq_imp = imputar_ceros_bayes(physeq_limpio)
+  physeq_clr = microbiome::transform(physeq_imp, "clr")
+  
+  df_clr = as.data.frame(otu_table(physeq_clr))
+  taxa_info = as.data.frame(tax_table(physeq_clr))
+  
+  taxa_genus = taxa_info$Genus
+  taxa_genus[is.na(taxa_genus)] = "unclassified"
+  row.names(df_clr) = make.unique(as.character(taxa_genus))
+  
+  asv_df_T = as.data.frame(t(df_clr))
+  asv_df_T[] = lapply(asv_df_T, function(x) as.numeric(as.character(x)))
+  
+  asv_df_T %>%
+    rownames_to_column(var = "sam_id") %>%
+    mutate(
+      sample_type = tipo_muestra,
+      time = case_when(
+        endsWith(sam_id, "-I")   ~ "I",
+        endsWith(sam_id, "-II")  ~ "II",
+        endsWith(sam_id, "-III") ~ "III",
+        TRUE ~ "Unknown"
+      ),
+      time = factor(time, levels = c("I", "II", "III"))
+    )
+}
+
+ps_milk  = subset_samples(HMilkclean_filtered, type == "Milk")
+ps_stool = subset_samples(HMilkclean_filtered, type == "Stool")
+
+df_milk_clr  = process_to_clr(ps_milk, "Milk")
+df_stool_clr = process_to_clr(ps_stool, "Stool")
+
+cluster_by_time_type_clr = c(
+  split(df_milk_clr, df_milk_clr$time),
+  split(df_stool_clr, df_stool_clr$time)
+)
+names(cluster_by_time_type_clr) = c(
+  paste0("Milk_", names(split(df_milk_clr, df_milk_clr$time))),
+  paste0("Stool_", names(split(df_stool_clr, df_stool_clr$time)))
+)
+cluster_by_time_type_clr = cluster_by_time_type_clr[sapply(cluster_by_time_type_clr, nrow) > 0]
+type_of_cluster_to_graph_clr = names(cluster_by_time_type_clr)
+```
+
+## 4.2 Índice de silueta (distancia euclidiana en espacio CLR)
+
+```{r clr_silhouette, include=FALSE}
+silhouette_plots_clr = list()
+
+for (group_name in type_of_cluster_to_graph_clr) {
+  current_df_clr = cluster_by_time_type_clr[[group_name]]
+  asv_numeric_clr = current_df_clr[sapply(current_df_clr, is.numeric)]
+  asv_numeric_clr[] = lapply(asv_numeric_clr, as.numeric)
+  asv_numeric_clr = asv_numeric_clr[, apply(asv_numeric_clr, 2, var) > 0]
+  
+  if (nrow(asv_numeric_clr) < 4) next
+  
+  aitchison_dist_matrix = dist(asv_numeric_clr, method = "euclidean")
+  
+  silhouette_scores = rep(NA, 10)
+  for (k in 2:10) {
+    if (k >= nrow(asv_numeric_clr)) break
+    pam_result = pam(aitchison_dist_matrix, k = k)
+    silhouette_scores[k] = pam_result$silinfo$avg.width
+  }
+  
+  plot_data = data.frame(k = 2:10, score = silhouette_scores[2:10])
+  plot_data = plot_data[!is.na(plot_data$score), ]
+  
+  silhouette_plots_clr[[group_name]] = ggplot(plot_data, aes(x = k, y = score)) +
+    geom_hline(yintercept = 0.70, linetype = "dashed", color = "#4CAF50", linewidth = 0.8, alpha = 0.6) +
+    geom_hline(yintercept = 0.50, linetype = "dashed", color = "#FF9800", linewidth = 0.8, alpha = 0.6) +
+    geom_hline(yintercept = 0.25, linetype = "dashed", color = "#F44336", linewidth = 0.8, alpha = 0.6) +
+    geom_line(color = "#0073C2", linewidth = 1) +
+    geom_point(color = "#0073C2", size = 3) +
+    annotate("text", x = max(plot_data$k), y = 0.85, label = "Strong (Very Good)", color = "#4CAF50", hjust = 1, fontface = "bold", size = 3.5) +
+    annotate("text", x = max(plot_data$k), y = 0.60, label = "Reasonable (Good)", color = "#FF9800", hjust = 1, fontface = "bold", size = 3.5) +
+    annotate("text", x = max(plot_data$k), y = 0.37, label = "Weak (Regular)", color = "#F44336", hjust = 1, fontface = "bold", size = 3.5) +
+    annotate("text", x = max(plot_data$k), y = 0.12, label = "Without Structure (Deficient)", color = "grey50", hjust = 1, fontface = "bold", size = 3.5) +
+    labs(
+      title = paste("Average Silhouette Score (CLR) -", group_name),
+      x = "Number of Clusters (k)",
+      y = "Average Silhouette Score"
+    ) +
+    scale_x_continuous(breaks = 2:10) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank())
+}
+```
+
+Los datos tienden a decaer en rendimiento en el promedio de silueta,
+tanto en heces como en leches. No se observan grupos reales.
+
+**Figura 3:** *Índice de silueta CLR en leche materna*
+
+```{r, fig.width=10, fig.height=12}
+#| label: fig-sil-leche-clr
+#| fig-cap: "Índice de silueta (CLR, distancia euclidiana) en leche materna."
+
+(silhouette_plots_clr[["Milk_I"]] / silhouette_plots_clr[["Milk_II"]] / silhouette_plots_clr[["Milk_III"]])
+```
+
+**Figura 4:** *Índice de silueta CLR en heces*
+
+```{r, fig.width=10, fig.height=12}
+#| label: fig-sil-heces-clr
+#| fig-cap: "Índice de silueta (CLR, distancia euclidiana) en heces del infante."
+
+(silhouette_plots_clr[["Stool_I"]] / silhouette_plots_clr[["Stool_II"]] / silhouette_plots_clr[["Stool_III"]])
+```
+
+# 5. Maldición de las Altas Dimensiones
+
+## 5.1 Robust PCA (Principal Component Pursuit)
+
+```{r rpca, include=FALSE}
+cluster_by_time_type_clr_Pursuit = list()
+
+for (group_name in names(cluster_by_time_type_clr)) {
+  current_df = cluster_by_time_type_clr[[group_name]]
+  metadata_P = current_df %>% dplyr::select(sample_type, time, sam_id)
+  asv_numeric = current_df %>% dplyr::select(-sample_type, -time, -sam_id)
+  asv_numeric[] = lapply(asv_numeric, as.numeric)
+  asv_numeric = asv_numeric[, apply(asv_numeric, 2, var) > 0]
+  
+  M = as.matrix(asv_numeric)
+  rpca_result = rpca(M, max.iter = 10000)
+  
+  L_matrix = rpca_result$L
+  L_df = as.data.frame(L_matrix)
+  colnames(L_df) = colnames(asv_numeric)
+  
+  cluster_by_time_type_clr_Pursuit[[group_name]] = cbind(metadata_P, L_df)
+}
+
+silhouette_plots_Pursuit = list()
+
+for (group_name in type_of_cluster_to_graph_clr) {
+  current_df = cluster_by_time_type_clr_Pursuit[[group_name]]
+  current_df = current_df %>% dplyr::select(-any_of(c("sample_type", "time", "sam_id")))
+  
+  asv_numeric = current_df[sapply(current_df, is.numeric)]
+  asv_numeric[] = lapply(asv_numeric, as.numeric)
+  asv_numeric = asv_numeric[, apply(asv_numeric, 2, var) > 0]
+  
+  if (nrow(asv_numeric) < 4) next
+  
+  aitchison_dist_matrix = vegdist(asv_numeric, method = "euclidean")
+  
+  silhouette_scores = rep(NA, 10)
+  for (k in 2:10) {
+    if (k >= nrow(asv_numeric)) break
+    pam_result = pam(aitchison_dist_matrix, k = k)
+    silhouette_scores[k] = pam_result$silinfo$avg.width
+  }
+  
+  plot_data = data.frame(k = 2:10, score = silhouette_scores[2:10])
+  plot_data = plot_data[!is.na(plot_data$score), ]
+  
+  silhouette_plots_Pursuit[[group_name]] = ggplot(plot_data, aes(x = k, y = score)) +
+    geom_hline(yintercept = 0.70, linetype = "dashed", color = "#4CAF50", linewidth = 0.8, alpha = 0.6) +
+    geom_hline(yintercept = 0.50, linetype = "dashed", color = "#FF9800", linewidth = 0.8, alpha = 0.6) +
+    geom_hline(yintercept = 0.25, linetype = "dashed", color = "#F44336", linewidth = 0.8, alpha = 0.6) +
+    geom_line(color = "#0073C2", linewidth = 1) +
+    geom_point(color = "#0073C2", size = 3) +
+    labs(
+      title = paste("Average Silhouette Score (RPCA L-Matrix) -", group_name),
+      x = "Number of Clusters (k)",
+      y = "Average Silhouette Score"
+    ) +
+    scale_x_continuous(breaks = 2:10) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank())
+}
+```
+
+**Figura 5:** *Índice de silueta (RPCA) por tiempo y tipo*
+
+```{r, fig.width=12, fig.height=12}
+#| label: fig-sil-rpca
+#| fig-cap: "Índice de silueta sobre la matriz L de RPCA, por tiempo y tipo de muestra."
+
+(silhouette_plots_Pursuit[["Milk_I"]] + silhouette_plots_Pursuit[["Stool_I"]]) /
+(silhouette_plots_Pursuit[["Milk_II"]] + silhouette_plots_Pursuit[["Stool_II"]]) /
+(silhouette_plots_Pursuit[["Milk_III"]] + silhouette_plots_Pursuit[["Stool_III"]])
+```
+
+## 5.2 Sparse Hierarchical Clustering (Lasso)
+
+Análisis especializado en **Heces**, el grupo más complejo de encontrar
+estructura. Se aplica penalización L1 para seleccionar variables:
+
+```{r sparse_hc, include=FALSE}
+# Stool I
+ST1 = cluster_by_time_type_clr[["Stool_I"]] %>%
+  dplyr::select(-sam_id, -sample_type, -time) %>% as.matrix()
+
+set.seed(123)
+perm_out1 = HierarchicalSparseCluster.permute(
+  x = ST1, wbounds = seq(1.5, 5, len = 10), nperms = 5
+)
+sparse_hc1 = HierarchicalSparseCluster(x = ST1, wbound = perm_out1$bestw)
+nombres_clave1 = colnames(ST1)[sparse_hc1$ws > 0]
+
+# Stool II
+ST2 = cluster_by_time_type_clr[["Stool_II"]] %>%
+  dplyr::select(-sam_id, -sample_type, -time) %>% as.matrix()
+
+set.seed(123)
+perm_out2 = HierarchicalSparseCluster.permute(
+  x = ST2, wbounds = seq(1.5, 5, len = 10), nperms = 5
+)
+sparse_hc2 = HierarchicalSparseCluster(x = ST2, wbound = perm_out2$bestw)
+nombres_clave2 = colnames(ST2)[sparse_hc2$ws > 0]
+
+# Stool III
+ST3 = cluster_by_time_type_clr[["Stool_III"]] %>%
+  dplyr::select(-sam_id, -sample_type, -time) %>% as.matrix()
+
+set.seed(123)
+perm_out3 = HierarchicalSparseCluster.permute(
+  x = ST3, wbounds = seq(1.5, 5, len = 10), nperms = 5
+)
+sparse_hc3 = HierarchicalSparseCluster(x = ST3, wbound = perm_out3$bestw)
+nombres_clave3 = colnames(ST3)[sparse_hc3$ws > 0]
+```
+
+**Figura 6:** *Dendrograma: Sparse Hierarchical Clustering, Stool-I*
+
+```{r}
+plot(sparse_hc1, main = "Dendrograma: Sparse Hierarchical Clustering, Stool-I")
+```
+
+**Figura 7:** *Dendrograma: Sparse Hierarchical Clustering, Stool-II*
+
+```{r}
+plot(sparse_hc2, main = "Dendrograma: Sparse Hierarchical Clustering, Stool-II")
+```
+
+**Figura 8:** *Dendrograma: Sparse Hierarchical Clustering, Stool-III*
+
+```{r}
+plot(sparse_hc3, main = "Dendrograma: Sparse Hierarchical Clustering, Stool-III")
+```
+
+### Bacterias discriminantes (Stool-I)
+
+De los `r ncol(ST1)` ASVs iniciales, el algoritmo seleccionó
+`r length(nombres_clave1)` para definir los clústeres:
+
+```{r}
+nombres_clave1 %>%
+  as.data.frame() %>%
+  dplyr::rename(Taxon = 1) %>%
+  gt() %>%
+  tab_header(
+    title = md("**Bacterias Discriminantes**"),
+    subtitle = "Características seleccionadas por Sparse Hierarchical Clustering (Stool-I)"
+  ) %>%
+  tab_style(
+    style = cell_text(style = "italic"),
+    locations = cells_body(columns = Taxon)
+  ) %>%
+  tab_source_note(
+    source_note = md("*Nota:* Selección generada bajo penalización L1.")
+  )
+```
+
+## 5.3 Dirichlet Multinomial Mixtures (DMM)
+
+Se ajustaron modelos DMM evaluando de 1 a 5 posibles agrupaciones para
+determinar la existencia de estructuras comunitarias latentes:
+
+```{r dmm, include=FALSE}
+ps_stool_I = subset_samples(ps_stool, samp_n == "I")
+ps_stool_I = prune_taxa(taxa_sums(ps_stool_I) > 0, ps_stool_I)
+ps_stool_I_genus = tax_glom(ps_stool_I, taxrank = "Genus", NArm = FALSE)
+
+taxa_info = as.data.frame(tax_table(ps_stool_I_genus))
+nombres_genero = taxa_info$Genus
+nombres_genero[is.na(nombres_genero)] = "unclassified"
+taxa_names(ps_stool_I_genus) = make.unique(as.character(nombres_genero))
+
+matriz_conteos = as(otu_table(ps_stool_I_genus), "matrix")
+if (taxa_are_rows(ps_stool_I_genus)) matriz_conteos = t(matriz_conteos)
+
+muestras_vacias = rowSums(matriz_conteos) == 0
+if (any(muestras_vacias)) {
+  matriz_conteos = matriz_conteos[!muestras_vacias, ]
+}
+
+set.seed(1234)
+k_maximo = 5
+fit_dmm = lapply(1:k_maximo, function(k) dmn(count = matriz_conteos, k = k))
+
+lplc = sapply(fit_dmm, laplace)
+mejor_k = which.min(lplc)
+mejor_modelo = fit_dmm[[mejor_k]]
+```
+
+El análisis del ajuste probabilístico mediante la aproximación de
+Laplace reveló una minimización absoluta del error en $k = $`r mejor_k`:
+
+**Figura 9:** *Selección del modelo óptimo (DMM), Heces en T1*
+
+```{r}
+plot(1:k_maximo, lplc, type = "b", pch = 19, col = "blue",
+     xlab = "Número de Clústeres (k)", ylab = "Valor de Laplace",
+     main = "Selección del Modelo Óptimo (DMM), Heces en T1")
+abline(v = mejor_k, col = "red", lty = 2)
+```
+
+# 6. Maaslin2
+
+## 6.1 Pregunta de investigación
+
+¿Cómo cambia el microbioma según el tipo de parto, teniendo en cuenta
+que cada bebé es un individuo único que aporta varias muestras?
+
+- **Efectos fijos:** `b_type` (tipo de parto)
+- **Efectos aleatorios:** `p_code` (individuo)
+- **Referencia:** Vaginal
+- **Normalización:** TSS + LOG
+
+> Esto es un análisis de asociación, no implica causalidad.
+
+## 6.2 Generación de datos y ajuste de Maaslin2
+
+```{r maaslin_load, include=FALSE}
+build_maaslin_data = function(physeq_obj, metadata) {
+  # 1. Agrupar a nivel de género
+  asv_df_p = tax_glom(physeq_obj, taxrank = "Genus", NArm = FALSE)
+  asv_df_prev = as.data.frame(otu_table(asv_df_p))
+  taxa_info = as.data.frame(tax_table(asv_df_p))
+
+  taxa_genus = taxa_info$Genus
+  taxa_genus[is.na(taxa_genus)] = "unclassified"
+
+  if (length(rownames(asv_df_prev)) != length(taxa_info$Genus)) {
+    stop("El número de filas NO coinciden, revisa el estado de los datos")
+  }
+  row.names(asv_df_prev) = make.unique(as.character(taxa_genus))
+  asv_df_prev = as.data.frame(t(asv_df_prev))
+
+  abundancia_df = asv_df_prev %>%
+    rownames_to_column(var = "id_muestra") %>%
+    pivot_longer(cols = -id_muestra, names_to = "Taxon", values_to = "Abundancia") %>%
+    mutate(Taxon = gsub("\\.[0-9]+$", "", Taxon)) %>%
+    group_by(id_muestra, Taxon) %>%
+    summarise(Abundancia = sum(Abundancia), .groups = "drop") %>%
+    pivot_wider(names_from = Taxon, values_from = Abundancia) %>%
+    column_to_rownames(var = "id_muestra") %>%
+    dplyr::select(where(is.numeric))
+
+  muestras_comunes = intersect(rownames(abundancia_df), rownames(metadata))
+  abundancia_df = abundancia_df[muestras_comunes, ]
+  metadata_f = metadata[muestras_comunes, ]
+
+  abundancia_df = abundancia_df %>%
+    rownames_to_column(var = "id") %>%
+    mutate(type = case_when(
+      startsWith(id, "ML") ~ "Milk",
+      startsWith(id, "MH") ~ "Stool"
+    ))
+
+  # 5. Separar en leches y heces
+  maas_leches = abundancia_df %>%
+    filter(type == "Milk") %>%
+    column_to_rownames(var = "id") %>%
+    dplyr::select(where(is.numeric))
+
+  maas_heces = abundancia_df %>%
+    filter(type == "Stool") %>%
+    column_to_rownames(var = "id") %>%
+    dplyr::select(where(is.numeric))
+
+  list(maas_leches = maas_leches, maas_heces = maas_heces, metadata = metadata_f)
+}
+
+run_maaslin = function(input_data, metadata, output_dir) {
+  metadata = metadata[rownames(metadata) %in% rownames(input_data), ]
+  metadata = metadata %>%
+    dplyr::select(dplyr::any_of(c("p_code", "b_type")))
+
+  Maaslin2::Maaslin2(
+    input_data = input_data,
+    input_metadata = metadata,
+    output = output_dir,
+
+    # Efectos fijos: tipo de parto
+    fixed_effects = c("b_type"),
+
+    # Efectos aleatorios: ID de la persona
+    random_effects = c("p_code"),
+
+    # Parto vaginal como referencia
+    reference = c("b_type,Vaginal"),
+
+    min_abundance = 0.0001,
+    min_prevalence = 0.1,
+
+    normalization = "TSS", # Total Sum Scaling
+    transform = "LOG",     # Log transform
+    standardize = FALSE    # Mantener interpretabilidad de los coeficientes
+  )
+}
+
+# Generar los datos y correr Maaslin2 para ambos tipos de muestra
+maas_data = build_maaslin_data(HMilkclean_filtered, metadata)
+maas_leches = maas_data$maas_leches
+maas_heces  = maas_data$maas_heces
+
+cat("Maaslin - Leches:", dim(maas_leches), "\n")
+cat("Maaslin - Heces: ", dim(maas_heces), "\n")
+
+run_maaslin(maas_heces,  maas_data$metadata, paste0(gen_path, "/Data/processed/resultados_maaslin_heces"))
+run_maaslin(maas_leches, maas_data$metadata, paste0(gen_path, "/Data/processed/resultados_maaslin_leches"))
+
+# Cargar los resultados generados
+resultados_heces  = read.delim(paste0(gen_path, "/Data/processed/resultados_maaslin_heces/all_results.tsv"))
+resultados_leches = read.delim(paste0(gen_path, "/Data/processed/resultados_maaslin_leches/all_results.tsv"))
+```
+
+## 6.3 Coeficientes en heces
+
+```{r maaslin_stool_plot, include=FALSE}
+resultados_sig_h = resultados_heces %>%
+  filter(qval < 0.25) %>%
+  mutate(sign = ifelse(coef > 0, "Positivo", "Negativo")) %>%
+  mutate(feature = reorder(feature, coef))
+```
+
+**Figura 10:** *Taxones diferencialmente abundantes entre partos cesárea vs. vaginales, en heces*
+
+```{r}
+resultados_sig_h %>%
+  ggplot(mapping = aes(x = coef, y = feature, fill = sign)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("Positivo" = "#66CC9A", "Negativo" = "#9999CB")) +
+  labs(
+    x = "Maaslin Coefficient (Cesárea vs. Vaginal)",
+    y = "Taxon"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+No se observan taxones significativos en heces.
+
+## 6.4 Coeficientes en leches
+
+```{r maaslin_milk_plot, include=FALSE}
+resultados_sig_l = resultados_leches %>%
+  filter(qval < 0.25) %>%
+  mutate(sign = ifelse(coef > 0, "Positivo", "Negativo")) %>%
+  mutate(feature = reorder(feature, coef))
+```
+
+**Figura 11:** *Taxones diferencialmente abundantes entre partos cesárea vs. vaginales, en leches*
+
+```{r}
+resultados_sig_l %>%
+  ggplot(mapping = aes(x = coef, y = feature, fill = sign)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("Positivo" = "#66CC9A", "Negativo" = "#9999CB")) +
+  labs(
+    x = "Maaslin Coefficient (Cesárea vs. Vaginal)",
+    y = "Taxón"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+# 7. PERMANOVA
+
+## 7.1 Tipo de parto (Heces T1)
+
+Se evalúa si el tipo de parto explica la variación en la composición
+microbiana (distancia Bray-Curtis):
+
+```{r permanova, include=FALSE}
+subset_test_stool = cluster_by_time_type[["Stool_I"]]
+
+m1 = metadata %>%
+  filter(sam_ %in% subset_test_stool$sam_id)
+
+subset_test_stool$type_t = m1$b_type
+
+subset_test_stool2 = subset_test_stool %>% select_if(is.numeric)
+subset_test_stool2 = subset_test_stool2[, colSums(subset_test_stool2) > 0]
+
+bray_dist_matrix = vegdist(subset_test_stool2, method = "bray")
+
+set.seed(123)
+permanova_res = adonis2(bray_dist_matrix ~ type_t,
+                         data = subset_test_stool,
+                         permutations = 999)
+```
+
+```{r}
+permanova_res
+```
+
+No se logra obtener suficiente evidencia de que el tipo de parto
+explique la variación en la composición microbiana de heces en el
+tiempo I.
+
+# 8. UMAP Supervisado
+
+Se introduce la etiqueta temporal como variable objetivo para evaluar
+si el algoritmo puede separar los tiempos de muestreo:
+
+```{r umap_supervised, include=FALSE}
+# Trayectorias
+datos_trayectoriaMilk = asv_df_genus %>%
+  filter(sample_type == "Milk") %>%
+  mutate(paciente_id = sub("-[^-]+$", "", sam_id)) %>%
+  arrange(paciente_id, time)
+
+metadatosMilk = datos_trayectoriaMilk %>%
+  select(sam_id, sample_type, time, paciente_id)
+
+asv_numeric_traj1 = datos_trayectoriaMilk %>%
+  select(-sam_id, -sample_type, -time, -paciente_id)
+asv_numeric_traj1[] = lapply(asv_numeric_traj1, as.numeric)
+filas_validas = rowSums(asv_numeric_traj1) > 0
+asv_numeric_traj1 = asv_numeric_traj1[filas_validas, ]
+asv_numeric_traj1 = asv_numeric_traj1[, colSums(asv_numeric_traj1) > 0]
+metadatosMilk = metadatosMilk[filas_validas, ]
+
+datos_trayectoriaStool = asv_df_genus %>%
+  filter(sample_type == "Stool") %>%
+  mutate(paciente_id = sub("-[^-]+$", "", sam_id)) %>%
+  arrange(paciente_id, time)
+
+metadatosStool = datos_trayectoriaStool %>%
+  select(sam_id, sample_type, time, paciente_id)
+
+asv_numeric_traj2 = datos_trayectoriaStool %>%
+  select(-sam_id, -sample_type, -time, -paciente_id)
+asv_numeric_traj2[] = lapply(asv_numeric_traj2, as.numeric)
+filas_validas = rowSums(asv_numeric_traj2) > 0
+asv_numeric_traj2 = asv_numeric_traj2[filas_validas, ]
+asv_numeric_traj2 = asv_numeric_traj2[, colSums(asv_numeric_traj2) > 0]
+metadatosStool = metadatosStool[filas_validas, ]
+
+# UMAP supervisado - Leches
+variable_y = metadatosMilk$time
+set.seed(1234)
+umap_resL = vegdist(asv_numeric_traj1, method = "bray")
+umap_sup_milk = uwot::umap(
+  X = umap_resL, y = variable_y,
+  target_weight = 0.3, n_neighbors = 10, min_dist = 0.1
+)
+umap_coords_sup = as.data.frame(umap_sup_milk)
+colnames(umap_coords_sup) = c("UMAP1", "UMAP2")
+plot_data_sup_milk = bind_cols(metadatosMilk, umap_coords_sup)
+
+# UMAP supervisado - Heces
+variable_y = metadatosStool$time
+set.seed(1234)
+umap_res2 = vegdist(asv_numeric_traj2, method = "bray")
+umap_sup_stool = uwot::umap(
+  X = umap_res2, y = variable_y,
+  target_weight = 0.3, n_neighbors = 5, min_dist = 0.1
+)
+umap_coords_sup = as.data.frame(umap_sup_stool)
+colnames(umap_coords_sup) = c("UMAP1", "UMAP2")
+plot_data_sup_stool = bind_cols(metadatosStool, umap_coords_sup)
+```
+
+**Figura 12:** *UMAP supervisado: Trayectoria temporal en leches*
+
+```{r}
+ggplot(plot_data_sup_milk, aes(x = UMAP1, y = UMAP2)) +
+  geom_path(aes(group = paciente_id),
+            arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+            color = "gray60", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(fill = time), shape = 21, size = 4, color = "black") +
+  scale_fill_manual(values = c("I" = "#E69F00", "II" = "#56B4E9", "III" = "#009E73")) +
+  labs(
+    title = "Trayectoria Temporal del Microbioma en Leches (UMAP Supervisado)",
+    subtitle = "Espacio Topológico No Lineal",
+    x = "UMAP 1", y = "UMAP 2", fill = "Tiempo"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+```
+
+**Figura 13:** *UMAP supervisado: Trayectoria temporal en heces*
+
+```{r}
+ggplot(plot_data_sup_stool, aes(x = UMAP1, y = UMAP2)) +
+  geom_path(aes(group = paciente_id),
+            arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+            color = "gray60", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(fill = time), shape = 21, size = 4, color = "black") +
+  scale_fill_manual(values = c("I" = "#E69F00", "II" = "#56B4E9", "III" = "#009E73")) +
+  labs(
+    title = "Trayectoria Temporal del Microbioma en Heces (UMAP Supervisado)",
+    subtitle = "Espacio Topológico No Lineal",
+    x = "UMAP 1", y = "UMAP 2", fill = "Tiempo"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+```
+
+Se observa tendencia de agrupamiento, pero con cautela: hay valores
+atípicos que influyen en la estructura. Los datos indican que dentro de
+las bacterias sí hay diferencias temporales, pero UMAP realiza
+transformaciones no lineales que dificultan determinar cuáles son las
+evidencias que realmente discriminan el tiempo.

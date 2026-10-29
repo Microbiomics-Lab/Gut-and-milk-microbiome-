@@ -1,0 +1,30 @@
+                                                                                                                              Variable Original Nuevo Recode
+                                                                                                                         Código de Participante       Preg_0
+                                                                                                                             Número de Muestreo       Preg_1
+                                                                                             Fecha de nacimiento del participante (día/mes/año)       Preg_2
+                                                                                                                             Tipo de nacimiento       Preg_3
+                                                                                                            Edad al momento del muestreo (días)       Preg_4
+                                                                                                         Fecha de toma de muestra (día/mes/año)       Preg_5
+                                                                               Peso (en gramos) del participante el día de la toma de muestras        Preg_6
+                                                                          Talla (en centímetros) del participante el día de la toma de muestras       Preg_7
+                                                              La mamá ha tomado antibióticos desde la última toma de muestras del participante?       Preg_8
+                                                       ¿Su bebé ha tomado algún antibiótico desde que nació o desde la última toma de muestras?       Preg_9
+                                                                                 ¿La dieta de su bebé es completamente a base de leche materna?      Preg_10
+                                                                                          ¿Su bebé tiene contacto directo con animales caseros?      Preg_11
+                                                                                                ¿Su bebé asiste a una guardería durante el día?      Preg_12
+¿Su bebé ha consumido probióticos (ej. yogurt, Multiflora, Perenterol, gotitas Gerber, AbColic, BioGaia Protectis,  etc) durante el último mes?      Preg_13
+                                                                                                  Semana de gestación a la fecha del nacimiento      Preg_14
+                                                                                              ¿Su bebé sufre de cólicos, gases o estreñimiento?      Preg_15
+                                                                              Altura (en centímetros) de la madre en el último mes de gestación      Preg_16
+                                                                               La mamá tomó antibióticos en algún momento durante del embarazo?      Preg_17
+                                                                                             La mamá tomó antibióticos en el proceso del parto?      Preg_18
+                                                                                               Talla del participante al nacer (en centímetros)      Preg_19
+                                                                                                     Peso del participante al nacer (en gramos)      Preg_20
+                                                                                 Peso (en kilogramos) de la madre en el último mes de gestación      Preg_21
+                                                                                                                          Sexo del participante      Preg_22
+                                                                                                                                     wb_samp_kg      Preg_23
+                                                                                                                                      hb_samp_m      Preg_24
+                                                                                                                                        g_index      Preg_25
+                                                                                                                                        b_bw_kg      Preg_26
+                                                                                                                                        b_bh_kg      Preg_27
+                                                                                                                                     g_index_t0      Preg_28

@@ -1,0 +1,1578 @@
+---
+title: "02 - Descriptive Analysis"
+author: "Esteven Aragón"
+date: "2025-09-27"
+output:
+  word_document:
+    toc: true
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+
+fig_dir = Sys.getenv("PIPELINE_FIGDIR", unset = "")
+
+if (nzchar(fig_dir)) {
+  fig_path_knitr = paste0(normalizePath(fig_dir, winslash = "/", mustWork = FALSE), "/")
+  
+  dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+  knitr::opts_chunk$set(
+    fig.path = fig_path_knitr,
+    dev = "png",
+    dpi = 300
+  )
+}
+```
+
+# 1. Configuración
+
+## 1.1 Librerías
+
+```{r libraries, include=FALSE}
+pacman::p_load(
+  rmarkdown, knitr,
+  gt, flextable, gtsummary,
+  PMCMRplus,
+  umap,
+  vegan,
+  phyloseq,
+  lattice,
+  scales, ggrepel, patchwork, ggpubr, ggplot2,
+  VennDiagram, UpSetR,
+  rlang, stringr, tidyr, purrr, tibble,
+  cowplot, grid, dplyr
+)
+```
+
+## 1.2 Carga de objetos limpios
+
+Los objetos se cargan desde `Data/processed/`, generados por el archivo
+`01_Data_Cleaning.Rmd`:
+
+```{r load_objects, include=FALSE}
+gen_path  = getwd()
+gen_path  = gsub("notebooks", "", gen_path)
+data_path = paste0(gen_path, "Data")
+proc_path = paste0(data_path, "/processed")
+
+HMilkclean_filtered = readRDS(paste0(proc_path, "/HMilkclean_filtered.rds"))
+HMilk_clean_genus   = readRDS(paste0(proc_path, "/HMilk_clean_genus.rds"))
+HMS_rarefied        = readRDS(paste0(proc_path, "/HMS_rarefied.rds"))
+
+metadata = readRDS(paste0(proc_path, "/metadata_clean.rds"))
+df = readRDS(paste0(proc_path, "/df_clean.rds"))
+
+otu_raw = readRDS(paste0(proc_path, "/otu_raw.rds"))
+tax_raw = readRDS(paste0(proc_path, "/tax_raw.rds"))
+
+mis_rds = readRDS(paste0(data_path, "/paleta_colores_generos.rds"))
+
+cat("Objetos cargados correctamente.\n")
+cat("Muestras (filtrado):", nsamples(HMilkclean_filtered), "\n")
+cat("Individuos:", length(unique(df$p_code)), "\n")
+```
+
+# 2. Tablas resumen de la cohorte
+
+## 2.1 Variables de información por tiempo
+
+```{r labels, include=FALSE}
+info_labels = list(
+  ab_mom  ~ "Maternal Antibiotics",
+  f_type  ~ "Feeding Type",
+  pro_bio ~ "Probiotic Consumption"
+)
+
+maternal_labels = list(
+  ab_gest ~ "Gestation Antibiotics",
+  ab_birth ~ "Birth Antibiotics",
+  s_bmi   ~ "Maternal BMI (end of pregnancy)",
+  s_bmi_c ~ "Maternal BMI Category"
+)
+
+infant_labels = list(
+  b_type     ~ "Birth Type",
+  ab_baby    ~ "Infant Antibiotics",
+  bm_excl    ~ "Exclusive Breastfeeding",
+  animal_cont ~ "Animal Contact",
+  daycare    ~ "Daycare Attendance",
+  gest_week  ~ "Gestational Week",
+  colic      ~ "Colic",
+  b_bh       ~ "Birth Height (cm)",
+  g_index    ~ "Growth Index"
+)
+
+info_vars     = sapply(info_labels, function(x) as.character(x[[2]]))
+maternal_vars = sapply(maternal_labels, function(x) as.character(x[[2]]))
+infant_vars   = sapply(infant_labels, function(x) as.character(x[[2]]))
+
+cont_vars = c("gest_week", "b_bh", "g_index")
+```
+
+```{r summary_tables, include=FALSE}
+df_filtrado_info = df %>%
+  group_by(p_code, samp_n) %>%
+  summarise(
+    time_ = case_when(
+      samp_n == 1 ~ "I",
+      samp_n == 2 ~ "II",
+      samp_n == 3 ~ "III"
+    ),
+    ab_mom  = names(sort(table(ab_mom), decreasing = TRUE))[1],
+    f_type  = names(sort(table(f_type), decreasing = TRUE))[1],
+    pro_bio = names(sort(table(pro_bio), decreasing = TRUE))[1],
+    .groups = "drop"
+  ) %>%
+  select(any_of(info_vars), time_)
+
+df_filtrado_mater = df %>%
+  select(all_of(maternal_vars), p_code, samp_n) %>%
+  group_by(p_code) %>%
+  summarise(
+    s_bmi    = round(mean(s_bmi, na.rm = TRUE), 4),
+    ab_gest  = names(sort(table(ab_gest), decreasing = TRUE))[1],
+    ab_birth = names(sort(table(ab_birth), decreasing = TRUE))[1],
+    s_bmi_c  = names(sort(table(s_bmi_c), decreasing = TRUE))[1]
+  ) %>%
+  ungroup()
+
+df_infant_resumen = df %>%
+  select(all_of(infant_vars), p_code, samp_n) %>%
+  group_by(p_code) %>%
+  filter(n_distinct(samp_n) >= 2) %>%
+  summarise(
+    across(all_of(cont_vars), ~ round(mean(.x, na.rm = TRUE), 4), .names = "{.col}"),
+    across(
+      setdiff(infant_vars, cont_vars),
+      ~ names(sort(table(.x), decreasing = TRUE))[1],
+      .names = "{.col}"
+    )
+  ) %>%
+  ungroup()
+```
+
+La **Tabla 1** resume las características clínicas y nutricionales de la
+cohorte a través de los tres puntos temporales (I, II, III). La muestra
+presenta gran estabilidad en sus hábitos: la exposición a antibióticos
+maternos es mínima (>94% negativos), la lactancia materna exclusiva se
+mantiene como vía predominante (~61%), y el consumo de probióticos se
+reporta en poco más de un tercio (35-38%).
+
+```{r, eval=TRUE}
+#| label: tbl-re12
+#| tbl-cap: "Resumen de las variables de información por tiempo de muestreo."
+
+df_filtrado_info %>%
+  tbl_summary(
+    by = time_,
+    label = info_labels,
+    statistic = list(all_categorical() ~ "{n} ({p}%)")
+  ) %>%
+  add_p() %>%
+  bold_labels()
+```
+
+La **Tabla 2** presenta los antecedentes maternos de la cohorte completa
+($N=51$). La exposición a antibióticos durante la gestación fue baja
+(16%), mientras que en el momento del parto abarcó a la mayoría (63%).
+El IMC materno al final del embarazo promedió 16.85 (rango: 14.09 –
+19.98).
+
+```{r, eval=TRUE}
+#| label: tbl-res523-madre
+#| tbl-cap: "Resumen de las variables maternas durante el embarazo."
+
+df_filtrado_mater %>%
+  select(all_of(maternal_vars)) %>%
+  tbl_summary(
+    label = maternal_labels,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)",
+      all_continuous()  ~ "{mean} [{min} – {max}]"
+    ),
+    digits = all_continuous() ~ 2
+  ) %>%
+  bold_labels()
+```
+
+La **Tabla 3** describe el perfil clínico y de desarrollo de los infantes
+($N=51$). La edad gestacional promedió 38.75 semanas, la talla inicial
+49.76 cm, y la vía de parto predominante fue cesárea (57%). El índice de
+crecimiento poblacional registró un valor medio de 10.89 (rango: 8.94 –
+13.06).
+
+```{r, eval=TRUE}
+#| label: tbl-resdf47665
+#| tbl-cap: "Resumen de las variables del infante durante su desarrollo."
+
+df_infant_resumen %>%
+  select(all_of(infant_vars)) %>%
+  tbl_summary(
+    label = infant_labels,
+    type = list(gest_week ~ "continuous"),
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)",
+      all_continuous()  ~ "{mean} [{min} – {max}]"
+    ),
+    digits = all_continuous() ~ 2
+  ) %>%
+  bold_labels()
+```
+
+# 3. Índice de crecimiento (descriptivo)
+
+## 3.1 Test de Skillings-Mack
+
+Para determinar si existen diferencias significativas en el índice de
+crecimiento a través de los puntos temporales, se implementó el test de
+Skillings-Mack, alternativa idónea para diseños de medidas repetidas
+desbalanceadas:
+
+```{r, include=FALSE}
+df = df %>%
+  mutate(
+    t_time = case_when(
+      samp_n == 1 ~ "I",
+      samp_n == 2 ~ "II",
+      samp_n == 3 ~ "III"
+    )
+  )
+df$t_time = factor(df$t_time, levels = c("I", "II", "III"))
+
+matriz_desbalanceada = xtabs(g_index ~ p_code + t_time, data = df)
+matriz_desbalanceada[matriz_desbalanceada == 0] = NA
+matriz_limpia = as.matrix(matriz_desbalanceada)
+
+resultado_MackSkill = skillingsMackTest(matriz_limpia)
+```
+
+Se encontró suficiente evidencia para rechazar la hipótesis nula de que
+el promedio de crecimiento en los 3 tiempos es igual ($\alpha = 0.05$).
+
+## 3.2 Evolución por sexo
+
+```{r, warning=FALSE, error=FALSE}
+#| label: fig-evolucion-peso
+#| fig-cap: "Cambio del índice de crecimiento según la edad, observado por persona y sexo."
+
+df$sex = as.factor(df$sex)
+
+xyplot(g_index ~ age_d | sex,
+       data = df,
+       groups = p_code,
+       type = c("p", "a"),
+       panel = function(x, y, ...) {
+         panel.xyplot(x, y, ...)
+         panel.lmline(x, y, col = "black", lwd = 2, lty = 1)
+       },
+       key = list(
+         space = "top",
+         columns = 2,
+         text = list(c("Overall Regression by Sex", "By Person")),
+         lines = list(col = c("black", "transparent"), lty = 1, lwd = 2),
+         points = list(pch = 1, col = c("transparent", "orange"))
+       ),
+       xlab = "Age in Days",
+       ylab = "Patient Growth Index"
+)
+```
+
+## 3.3 Observaciones con disminución del índice
+
+Algunas unidades muestrales presentaron una reducción del índice de
+crecimiento. Estos datos provienen del peso del usuario (factor de la
+ecuación del índice), por lo que no representan un error:
+
+```{r}
+#| label: tbl-resumen-madre
+#| tbl-cap: "Observaciones con disminución posterior del G Index."
+
+datos_reporte = df %>%
+  filter(p_code %in% c("MB-011", "MB-024")) %>%
+  select(p_code, samp_n, g_index)
+
+flextable(datos_reporte) %>%
+  set_header_labels(
+    p_code  = "Subject Code",
+    samp_n  = "Sample No.",
+    g_index = "G Index"
+  ) %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all") %>%
+  bold(part = "header") %>%
+  bold(j = "p_code", part = "body")
+```
+
+## 3.4 Trayectoria con regresión
+
+La mayor parte de los datos se ajusta a las bandas de confianza. La línea
+de regresión y la curva LOESS se mantienen paralelas, aunque destaca una
+observación que se desvía notablemente:
+
+```{r}
+#| label: fig-tray-crec-edad32
+#| fig-cap: "Trayectoria del índice de crecimiento con la edad por tiempo de observación."
+
+df$samp_n = as.factor(df$samp_n)
+
+plot(df$age_d, df$g_index,
+     type = "n",
+     xlab = "Age in Days",
+     ylab = "Patient Growth Index",
+     main = "")
+
+grid(col = "lightgray", lty = "dotted")
+
+points(df$age_d[df$samp_n == 1], df$g_index[df$samp_n == 1], pch = 4, col = "black")
+points(df$age_d[df$samp_n == 2], df$g_index[df$samp_n == 2], pch = 1, col = "black")
+points(df$age_d[df$samp_n == 3], df$g_index[df$samp_n == 3], pch = 2, col = "black")
+
+abline(lm(g_index ~ age_d, data = df), col = "black", lwd = 2)
+
+linea_suave = loess(g_index ~ age_d, data = df)
+j = order(df$age_d)
+lines(df$age_d[j], predict(linea_suave)[j], col = "black", lty = 2, lwd = 2)
+
+legend("bottomright",
+       legend = c("T1 (x)", "T2 (o)", "T3 (Δ)"),
+       pch = c(4, 1, 2),
+       col = "black",
+       bty = "n")
+```
+
+# 4. Taxonomía descriptiva
+
+## 4.1 Muestras por tiempo y tipo
+
+```{r, include=FALSE}
+sample_info = data.frame(
+  sam_id = colnames(otu_raw),
+  stringsAsFactors = FALSE
+)
+sample_info$type_sample = ifelse(startsWith(sample_info$sam_id, "ML"), "Leches", "Heces")
+sample_info$time = ifelse(
+  endsWith(sample_info$sam_id, "-I"), "I",
+  ifelse(endsWith(sample_info$sam_id, "-II"), "II", "III")
+)
+```
+
+```{r, include=TRUE}
+#| label: tbl-muestras-tipo
+#| tbl-cap: "Cantidad de observaciones por tiempo y tipo de muestra."
+
+table(sample_info$time, sample_info$type_sample)
+```
+
+## 4.2 Distribución de muestras
+
+```{r}
+#| label: tbl-resk02
+#| tbl-cap: "Distribución de muestras por tiempo y tipo."
+
+df_freq_time = cbind(
+  table(sample_info$time, sample_info$type_sample)[, 1],
+  table(sample_info$time, sample_info$type_sample)[, 2]
+) %>%
+  as.data.frame()
+
+colnames(df_freq_time) = c("Heces", "Leches")
+
+df_freq_time %>%
+  gt(rownames_to_stub = TRUE) %>%
+  tab_stubhead(label = "Tiempo") %>%
+  tab_header(
+    title = "Distribución de Muestras",
+    subtitle = "Conteo de observaciones por tiempo y tipo"
+  )
+```
+
+## 4.3 Top ASVs en heces
+
+```{r}
+#| label: tbl-resad7512
+#| tbl-cap: "Principales secuencias con mayor número de READS en heces."
+
+otu_mat_stool = otu_raw[, colnames(otu_raw) %in% sample_info$sam_id[startsWith(sample_info$sam_id, "MH")], drop = FALSE]
+
+top_otus = sort(rowSums(otu_mat_stool), decreasing = TRUE)[1:10]
+df_resultados = enframe(top_otus, name = "Secuencia_ID", value = "Abundancia")
+
+df_resultados %>%
+  gt() %>%
+  tab_header(title = "Top 10 Secuencias más Abundantes, en heces") %>%
+  fmt_number(columns = Abundancia, decimals = 0, use_seps = TRUE) %>%
+  cols_align(align = "left", columns = Secuencia_ID)
+```
+
+## 4.4 Top ASVs en leches
+
+```{r}
+#| label: tbl-res344sdfg
+#| tbl-cap: "Principales secuencias con mayor número de READS en leches."
+
+otu_mat_milk = otu_raw[, colnames(otu_raw) %in% sample_info$sam_id[startsWith(sample_info$sam_id, "ML")], drop = FALSE]
+
+top_otus = sort(rowSums(otu_mat_milk), decreasing = TRUE)[1:10]
+df_resultados = enframe(top_otus, name = "Secuencia_ID", value = "Abundancia")
+
+df_resultados %>%
+  gt() %>%
+  tab_header(title = "Top 10 Secuencias más Abundantes, en leches") %>%
+  fmt_number(columns = Abundancia, decimals = 0, use_seps = TRUE) %>%
+  cols_align(align = "left", columns = Secuencia_ID)
+```
+
+## 4.5 Taxón dominante en leches
+
+```{r}
+#| label: tbl-res424hdyem
+#| tbl-cap: "Unidad en mayor proporción en leches."
+
+top_asv_milk = names(sort(rowSums(otu_mat_milk), decreasing = TRUE))[1]
+TAX_fill = as.data.frame(tax_raw)
+r1 = TAX_fill[rownames(TAX_fill) == top_asv_milk, ]
+
+flextable(r1) %>%
+  set_header_labels(
+    "X" = "OTU", "Kingdom" = "Kingdom", "Phylum" = "Phylum",
+    "Class" = "Class", "Order" = "Order", "Family" = "Family",
+    "Genus" = "Genus", "Species" = "Species"
+  ) %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all") %>%
+  bold(part = "header")
+```
+
+## 4.6 Taxón dominante en heces
+
+```{r}
+#| label: tbl-res424hdie83
+#| tbl-cap: "Unidad en mayor proporción en heces."
+
+top_asv_stool = names(sort(rowSums(otu_mat_stool), decreasing = TRUE))[1]
+r2 = TAX_fill[rownames(TAX_fill) == top_asv_stool, ]
+
+flextable(r2) %>%
+  set_header_labels(
+    "X" = "OTU", "Kingdom" = "Kingdom", "Phylum" = "Phylum",
+    "Class" = "Class", "Order" = "Order", "Family" = "Family",
+    "Genus" = "Genus", "Species" = "Species"
+  ) %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all") %>%
+  bold(part = "header")
+```
+
+## 4.7 Resumen por nivel taxonómico
+
+```{r}
+tax_df = as.data.frame(tax_raw)
+
+resumen_niveles = lapply(colnames(tax_df), function(nivel) {
+  datos_nivel = tax_df[[nivel]]
+  total_asvs = length(datos_nivel)
+  clasificados = sum(!is.na(datos_nivel) & datos_nivel != "" & datos_nivel != "unclassified")
+  nas = total_asvs - clasificados
+  
+  data.frame(
+    Nivel = nivel,
+    Total_ASVs = total_asvs,
+    Clasificados = clasificados,
+    No_Clasificados_NA = nas,
+    Porcentaje_Exito = round((clasificados / total_asvs) * 100, 2),
+    Riqueza_Taxones_Unicos = length(unique(na.omit(datos_nivel[datos_nivel != ""])))
+  )
+})
+
+tabla_final = do.call(rbind, resumen_niveles)
+colnames(tabla_final) = c("Level", "Total ASVs", "Classified",
+                          "Unclassified (NA)", "Success Percentage (%)",
+                          "Unique Taxa Richness")
+
+flextable(tabla_final) %>%
+  theme_vanilla() %>%
+  autofit() %>%
+  align(align = "center", part = "all") %>%
+  bold(part = "header")
+```
+
+## 4.8 Profundidad de secuenciación
+
+```{r, include=FALSE}
+profundidades = colSums(otu_table(HMilkclean_filtered))
+tipo_muestra = sample_data(HMilkclean_filtered)$type
+profundidades_separadas = split(profundidades, tipo_muestra)
+res_comparativo = sapply(profundidades_separadas, summary) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Statistics")
+```
+
+```{r}
+res_comparativo %>%
+  gt() %>%
+  fmt_number(columns = -Statistics, decimals = 2) %>%
+  tab_header(
+    title = "Depth of Sequencing Summary",
+    subtitle = "Comparison between Milk and Stool samples"
+  )
+```
+
+# 5. Índices de diversidad
+
+## 5.1 Cálculo
+
+```{r, include=FALSE}
+diversity_indices = estimate_richness(
+  HMS_rarefied,
+  measures = c("Observed", "Shannon", "Simpson")
+)
+
+diversity_indices$type_of_sample = ifelse(
+  startsWith(rownames(diversity_indices), "MH"), "Stool", "Milk"
+)
+
+diversity_indices = diversity_indices %>%
+  mutate(
+    time_of_sample = case_when(
+      endsWith(rownames(diversity_indices), ".I")   ~ "T1",
+      endsWith(rownames(diversity_indices), ".II")  ~ "T2",
+      endsWith(rownames(diversity_indices), ".III") ~ "T3"
+    ),
+    time_of_sample = factor(time_of_sample, levels = c("T1", "T2", "T3"))
+  )
+
+small_constant = 1e-9
+diversity_indices = diversity_indices %>%
+  mutate(
+    Simpson_adjusted = case_when(
+      Simpson == 0 ~ Simpson + small_constant,
+      Simpson == 1 ~ Simpson - small_constant,
+      TRUE ~ Simpson
+    ),
+    logit_Simpson = log(Simpson_adjusted / (1 - Simpson_adjusted))
+  )
+
+# Identificador del paciente (para pruebas pareadas) y orden para el emparejamiento
+diversity_indices$p_code = sub("^(ML|MH)", "MB", rownames(diversity_indices))
+diversity_indices = diversity_indices %>% arrange(p_code, time_of_sample)
+```
+
+## 5.2 Distribución por tiempo
+
+La microbiota intestinal del bebé gana diversidad a medida que crece,
+mientras que la diversidad de la leche materna disminuye o se estabiliza:
+
+```{r, include=FALSE}
+add_div_tests = function(y_global, y_pair, step_inc = 0.05) {
+  list(
+    # Prueba global Kruskal-Wallis
+    stat_compare_means(
+      method = "kruskal.test",
+      label = "p.signif",
+      y.position = y_global
+    ),
+    # Comparaciones pareadas con corrección de Holm
+    stat_compare_means(
+      method = "wilcox.test",
+      comparisons = list(c("T1", "T2"), c("T2", "T3"), c("T1", "T3")),
+      p.adjust.method = "holm",
+      label = "p.signif",
+      y.position = y_pair,
+      step.increase = step_inc
+    )
+  )
+}
+
+# (A) Simpson en Heces
+p1_s = diversity_indices %>%
+  filter(type_of_sample == "Stool") %>%
+  ggplot(aes(x = time_of_sample, y = logit_Simpson)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.25) +
+  labs(y = "logit(SDI)", x = "Time Point", title = "Infant Stool") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  coord_cartesian(ylim = c(-2.5, 5.2)) +
+  add_div_tests(y_global = 4.9, y_pair = c(3.7, 4.1, 4.5))
+
+# (B) Simpson en Leche
+p2_m = diversity_indices %>%
+  filter(type_of_sample == "Milk") %>%
+  ggplot(aes(x = time_of_sample, y = logit_Simpson)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.25) +
+  labs(y = "logit(SDI)", x = "Time Point", title = "Breast Milk") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  coord_cartesian(ylim = c(-2.5, 5.2)) +
+  add_div_tests(y_global = 4.9, y_pair = c(3.7, 4.1, 4.5))
+
+# (C) Shannon en Heces
+p3_s = diversity_indices %>%
+  filter(type_of_sample == "Stool") %>%
+  ggplot(aes(x = time_of_sample, y = Shannon)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.25) +
+  labs(y = "ShDI", x = "Time Point", title = "Infant Stool") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  coord_cartesian(ylim = c(0, 5.2)) +
+  add_div_tests(y_global = 4.9, y_pair = c(3.7, 4.1, 4.5))
+
+# (D) Shannon en Leche
+p4_m = diversity_indices %>%
+  filter(type_of_sample == "Milk") %>%
+  ggplot(aes(x = time_of_sample, y = Shannon)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.25) +
+  labs(y = "ShDI", x = "Time Point", title = "Breast Milk") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  coord_cartesian(ylim = c(0, 5.2)) +
+  add_div_tests(y_global = 4.9, y_pair = c(3.7, 4.1, 4.5))
+
+# (E) Observed en Heces
+p5_s = diversity_indices %>%
+  filter(type_of_sample == "Stool") %>%
+  ggplot(aes(x = time_of_sample, y = Observed)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.25) +
+  labs(y = "Observed", x = "Time Point", title = "Infant Stool") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  coord_cartesian(ylim = c(0, 180)) +
+  add_div_tests(y_global = 170, y_pair = c(135, 147, 159))
+
+# (F) Observed en Leche
+p6_m = diversity_indices %>%
+  filter(type_of_sample == "Milk") %>%
+  ggplot(aes(x = time_of_sample, y = Observed)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.25) +
+  labs(y = "Observed", x = "Time Point", title = "Breast Milk") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  coord_cartesian(ylim = c(0, 180)) +
+  add_div_tests(y_global = 170, y_pair = c(135, 147, 159))
+```
+
+**Figura 1:** *Análisis longitudinal del Índice de Simpson en heces y leche materna*
+
+```{r, fig.width=10, fig.height=8}
+(p1_s + p2_m)
+```
+
+**Figura 2:** *Análisis longitudinal del Índice de Shannon en heces y leche materna*
+
+```{r, fig.width=10, fig.height=8}
+(p3_s + p4_m)
+```
+
+**Figura 3:** *Análisis longitudinal de la riqueza de ASVs (Observed) en heces y leche materna*
+
+```{r, fig.width=10, fig.height=8}
+(p5_s + p6_m)
+```
+
+# 6. Ordenación descriptiva
+
+## 6.1 Preparación de datos (abundancia relativa)
+
+```{r, include=FALSE}
+ps_relative = transform_sample_counts(HMilkclean_filtered, function(x) x / sum(x))
+
+df_ps = as.data.frame(otu_table(ps_relative))
+taxa_info = as.data.frame(tax_table(ps_relative))
+
+taxa_genus = taxa_info$Genus
+taxa_genus[is.na(taxa_genus)] = "unclassified"
+row.names(df_ps) = make.unique(as.character(taxa_genus))
+
+asv_df_T = as.data.frame(t(df_ps))
+asv_df_T[] = lapply(asv_df_T, function(x) as.numeric(as.character(x)))
+
+asv_df_genus = asv_df_T %>%
+  rownames_to_column(var = "sam_id") %>%
+  mutate(
+    sample_type = case_when(
+      startsWith(sam_id, "MH") ~ "Stool",
+      startsWith(sam_id, "ML") ~ "Milk",
+      TRUE ~ "Other"
+    ),
+    time = case_when(
+      endsWith(sam_id, "-I")   ~ "I",
+      endsWith(sam_id, "-II")  ~ "II",
+      endsWith(sam_id, "-III") ~ "III"
+    ),
+    time = factor(time, levels = c("I", "II", "III"))
+  )
+
+cluster_by_time_type = split(
+  asv_df_genus,
+  f = list(asv_df_genus$sample_type, asv_df_genus$time),
+  sep = "_"
+)
+cluster_by_time_type = cluster_by_time_type[sapply(cluster_by_time_type, nrow) > 0]
+```
+
+## 6.2 PCoA por tiempo y tipo
+
+```{r, fig.height=8, fig.width=8}
+generar_plot_pcoa = function(datos_asv, nombre_grupo, color_puntos = "darkblue") {
+  bray_dist_matrix = vegdist(datos_asv, method = "bray")
+  pcoa_res = cmdscale(bray_dist_matrix, k = 2, eig = TRUE)
+  pve = round(100 * pcoa_res$eig / sum(pcoa_res$eig), 1)
+  
+  pcoa_df = data.frame(
+    Axis1 = pcoa_res$points[, 1],
+    Axis2 = pcoa_res$points[, 2]
+  )
+  
+  ggplot(pcoa_df, aes(x = Axis1, y = Axis2)) +
+    geom_point(size = 3, alpha = 0.7, color = color_puntos) +
+    labs(
+      title = paste("PCoA", nombre_grupo, "(Bray-Curtis)"),
+      x = paste0("PCo1 (", pve[1], "%)"),
+      y = paste0("PCo2 (", pve[2], "%)")
+    ) +
+    theme_bw()
+}
+
+pca1 = generar_plot_pcoa(cluster_by_time_type[["Milk_I"]]   %>% select(-sam_id, -sample_type, -time), "Milk I")
+pca2 = generar_plot_pcoa(cluster_by_time_type[["Milk_II"]]  %>% select(-sam_id, -sample_type, -time), "Milk II")
+pca3 = generar_plot_pcoa(cluster_by_time_type[["Milk_III"]] %>% select(-sam_id, -sample_type, -time), "Milk III")
+pca4 = generar_plot_pcoa(cluster_by_time_type[["Stool_I"]]  %>% select(-sam_id, -sample_type, -time), "Stool I")
+pca5 = generar_plot_pcoa(cluster_by_time_type[["Stool_II"]] %>% select(-sam_id, -sample_type, -time), "Stool II")
+pca6 = generar_plot_pcoa(cluster_by_time_type[["Stool_III"]]%>% select(-sam_id, -sample_type, -time), "Stool III")
+
+(pca1 + pca4) /
+(pca2 + pca5) /
+(pca3 + pca6)
+```
+
+## 6.3 UMAP por tiempo y tipo
+
+```{r, fig.height=8, fig.width=8}
+generar_plot_umap = function(datos_asv, nombre_grupo,
+                             vecinos = 5, dist_min = 0.1,
+                             semilla = 1234, color_puntos = "seagreen") {
+  d = vegdist(datos_asv, method = "bray")
+  cfg = umap.defaults
+  cfg$input       = "dist"
+  cfg$n_neighbors = vecinos
+  cfg$min_dist    = dist_min
+  
+  set.seed(semilla)
+  res = umap(as.matrix(d), config = cfg)
+  
+  df = data.frame(UMAP1 = res$layout[, 1], UMAP2 = res$layout[, 2])
+  
+  ggplot(df, aes(UMAP1, UMAP2)) +
+    geom_point(size = 3, alpha = 0.7, color = color_puntos) +
+    labs(title = paste0("UMAP ", nombre_grupo), x = "UMAP 1", y = "UMAP 2") +
+    theme_minimal()
+}
+
+pca1 = generar_plot_umap(cluster_by_time_type[["Milk_I"]]   %>% select(-sam_id, -sample_type, -time), "Milk I")
+pca2 = generar_plot_umap(cluster_by_time_type[["Milk_II"]]  %>% select(-sam_id, -sample_type, -time), "Milk II")
+pca3 = generar_plot_umap(cluster_by_time_type[["Milk_III"]] %>% select(-sam_id, -sample_type, -time), "Milk III")
+pca4 = generar_plot_umap(cluster_by_time_type[["Stool_I"]]  %>% select(-sam_id, -sample_type, -time), "Stool I")
+pca5 = generar_plot_umap(cluster_by_time_type[["Stool_II"]] %>% select(-sam_id, -sample_type, -time), "Stool II")
+pca6 = generar_plot_umap(cluster_by_time_type[["Stool_III"]]%>% select(-sam_id, -sample_type, -time), "Stool III")
+
+(pca1 + pca4) /
+(pca2 + pca5) /
+(pca3 + pca6)
+```
+
+## 6.4 PCoA por tipo de parto (Heces T1)
+
+```{r, include=FALSE}
+subset_test_stool = cluster_by_time_type[["Stool_I"]]
+
+m1 = metadata %>%
+  filter(sam_ %in% subset_test_stool$sam_id)
+
+subset_test_stool$type_t = m1$b_type
+
+subset_test_stool2 = subset_test_stool %>% select_if(is.numeric)
+subset_test_stool2 = subset_test_stool2[, colSums(subset_test_stool2) > 0]
+
+mis_colores = c("Cesarean" = "#E41A1C", "Vaginal" = "#377EB8")
+
+bray_dist_matrix = vegdist(subset_test_stool2, method = "bray")
+pcoa_res = cmdscale(bray_dist_matrix, k = 2, eig = TRUE)
+pve = round(100 * pcoa_res$eig / sum(pcoa_res$eig), 1)
+
+pcoa_df = data.frame(
+  Axis1 = pcoa_res$points[, 1],
+  Axis2 = pcoa_res$points[, 2]
+)
+pcoa_df$type_t = subset_test_stool$type_t
+```
+
+```{r}
+ggplot(pcoa_df, aes(x = Axis1, y = Axis2, color = type_t)) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_color_manual(values = mis_colores) +
+  labs(
+    title = "PCoA: Time I - Stool (Bray-Curtis)",
+    x = paste0("PCo1 (", pve[1], "%)"),
+    y = paste0("PCo2 (", pve[2], "%)"),
+    color = "Birth Type"
+  ) +
+  theme_bw()
+```
+
+## 6.5 Trayectorias temporales (PCoA)
+
+```{r, include=FALSE}
+# Leches
+datos_trayectoriaMilk = asv_df_genus %>%
+  filter(sample_type == "Milk") %>%
+  mutate(paciente_id = sub("-[^-]+$", "", sam_id)) %>%
+  arrange(paciente_id, time)
+
+metadatosMilk = datos_trayectoriaMilk %>%
+  select(sam_id, sample_type, time, paciente_id)
+
+asv_numeric_traj1 = datos_trayectoriaMilk %>%
+  select(-sam_id, -sample_type, -time, -paciente_id)
+asv_numeric_traj1[] = lapply(asv_numeric_traj1, as.numeric)
+filas_validas = rowSums(asv_numeric_traj1) > 0
+asv_numeric_traj1 = asv_numeric_traj1[filas_validas, ]
+asv_numeric_traj1 = asv_numeric_traj1[, colSums(asv_numeric_traj1) > 0]
+metadatosMilk = metadatosMilk[filas_validas, ]
+
+bray_dist_traj = vegdist(asv_numeric_traj1, method = "bray")
+pcoa_res = cmdscale(bray_dist_traj, k = 2, eig = TRUE)
+var_explicada = round(pcoa_res$eig / sum(pcoa_res$eig) * 100, 1)
+pcoa_coords_milk = as.data.frame(pcoa_res$points)
+colnames(pcoa_coords_milk) = c("PCo1", "PCo2")
+plot_data_milk = bind_cols(metadatosMilk, pcoa_coords_milk)
+
+# Heces
+datos_trayectoriaStool = asv_df_genus %>%
+  filter(sample_type == "Stool") %>%
+  mutate(paciente_id = sub("-[^-]+$", "", sam_id)) %>%
+  arrange(paciente_id, time)
+
+metadatosStool = datos_trayectoriaStool %>%
+  select(sam_id, sample_type, time, paciente_id)
+
+asv_numeric_traj2 = datos_trayectoriaStool %>%
+  select(-sam_id, -sample_type, -time, -paciente_id)
+asv_numeric_traj2[] = lapply(asv_numeric_traj2, as.numeric)
+filas_validas = rowSums(asv_numeric_traj2) > 0
+asv_numeric_traj2 = asv_numeric_traj2[filas_validas, ]
+asv_numeric_traj2 = asv_numeric_traj2[, colSums(asv_numeric_traj2) > 0]
+metadatosStool = metadatosStool[filas_validas, ]
+
+bray_dist_traj = vegdist(asv_numeric_traj2, method = "bray")
+pcoa_res = cmdscale(bray_dist_traj, k = 2, eig = TRUE)
+var_explicada_stool = round(pcoa_res$eig / sum(pcoa_res$eig) * 100, 1)
+pcoa_coords = as.data.frame(pcoa_res$points)
+colnames(pcoa_coords) = c("PCo1", "PCo2")
+plot_data_stool = bind_cols(metadatosStool, pcoa_coords)
+```
+
+**Figura 4:** *Trayectoria temporal del microbioma en leches (PCoA)*
+
+```{r}
+ggplot(plot_data_milk, aes(x = PCo1, y = PCo2)) +
+  geom_path(aes(group = paciente_id),
+            arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+            color = "gray60", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(fill = time), shape = 21, size = 4, color = "black") +
+  scale_fill_manual(values = c("I" = "#E69F00", "II" = "#56B4E9", "III" = "#009E73")) +
+  labs(
+    title = "Trayectoria Temporal del Microbioma en Leches",
+    subtitle = "Seguimiento individual (Tiempos I, II, III)",
+    x = paste0("PCo1 (", var_explicada[1], "%)"),
+    y = paste0("PCo2 (", var_explicada[2], "%)"),
+    fill = "Tiempo"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+```
+
+**Figura 5:** *Trayectoria temporal del microbioma en heces (PCoA)*
+
+```{r}
+ggplot(plot_data_stool, aes(x = PCo1, y = PCo2)) +
+  geom_path(aes(group = paciente_id),
+            arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+            color = "gray60", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(fill = time), shape = 21, size = 4, color = "black") +
+  scale_fill_manual(values = c("I" = "#E69F00", "II" = "#56B4E9", "III" = "#009E73")) +
+  labs(
+    title = "Trayectoria Temporal del Microbioma en Heces",
+    subtitle = "Seguimiento individual (Tiempos I, II, III)",
+    x = paste0("PCo1 (", var_explicada_stool[1], "%)"),
+    y = paste0("PCo2 (", var_explicada_stool[2], "%)"),
+    fill = "Tiempo"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+```
+
+## 6.6 Trayectorias temporales (UMAP)
+
+```{r, include=FALSE}
+set.seed(1234)
+umap_resL = vegdist(asv_numeric_traj1, method = "bray")
+umap_resL = uwot::umap(umap_resL, n_neighbors = 5, min_dist = 0.1)
+umap_coords = as.data.frame(umap_resL)
+colnames(umap_coords) = c("UMAP1", "UMAP2")
+plot_data_umap_milk = bind_cols(metadatosMilk, umap_coords)
+
+set.seed(1234)
+umap_res2 = vegdist(asv_numeric_traj2, method = "bray")
+umap_res2 = uwot::umap(umap_res2, n_neighbors = 5, min_dist = 0.1)
+umap_coords = as.data.frame(umap_res2)
+colnames(umap_coords) = c("UMAP1", "UMAP2")
+plot_data_umap_stool = bind_cols(metadatosStool, umap_coords)
+```
+
+**Figura 6:** *Trayectoria temporal del microbioma en leches (UMAP)*
+
+```{r}
+ggplot(plot_data_umap_milk, aes(x = UMAP1, y = UMAP2)) +
+  geom_path(aes(group = paciente_id),
+            arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+            color = "gray60", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(fill = time), shape = 21, size = 4, color = "black") +
+  scale_fill_manual(values = c("I" = "#E69F00", "II" = "#56B4E9", "III" = "#009E73")) +
+  labs(
+    title = "Trayectoria Temporal del Microbioma en Leches",
+    subtitle = "Espacio Topológico No Lineal (UMAP)",
+    x = "UMAP 1", y = "UMAP 2", fill = "Tiempo"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+```
+
+**Figura 7:** *Trayectoria temporal del microbioma en heces (UMAP)*
+
+```{r}
+ggplot(plot_data_umap_stool, aes(x = UMAP1, y = UMAP2)) +
+  geom_path(aes(group = paciente_id),
+            arrow = arrow(length = unit(0.25, "cm"), type = "closed"),
+            color = "gray60", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(fill = time), shape = 21, size = 4, color = "black") +
+  scale_fill_manual(values = c("I" = "#E69F00", "II" = "#56B4E9", "III" = "#009E73")) +
+  labs(
+    title = "Trayectoria Temporal del Microbioma en Heces",
+    subtitle = "Espacio Topológico No Lineal (UMAP)",
+    x = "UMAP 1", y = "UMAP 2", fill = "Tiempo"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), legend.position = "right")
+```
+
+## 6.7 Taxones asociados a PCo1 (Leches)
+
+```{r, include=FALSE}
+correlaciones_milk = cor(asv_numeric_traj1, pcoa_coords_milk, method = "spearman")
+df_correlaciones_milk = as.data.frame(correlaciones_milk) %>%
+  rownames_to_column(var = "ASV_Genus")
+
+top_derecha_PCo1 = df_correlaciones_milk %>%
+  arrange(desc(PCo1)) %>%
+  select(ASV_Genus, PCo1) %>%
+  head(10)
+top_derecha_PCo1["PCo1"] = round(top_derecha_PCo1["PCo1"], 4)
+
+top_izquierda_PCo1 = df_correlaciones_milk %>%
+  arrange(PCo1) %>%
+  select(ASV_Genus, PCo1) %>%
+  head(10)
+top_izquierda_PCo1["PCo1"] = round(top_izquierda_PCo1["PCo1"], 4)
+```
+
+**Top 10 taxones que empujan hacia la DERECHA del PCo1:**
+
+```{r}
+top_derecha_PCo1 %>% gt()
+```
+
+**Top 10 taxones que empujan hacia la IZQUIERDA del PCo1:**
+
+```{r}
+top_izquierda_PCo1 %>% gt()
+```
+
+# 7. Dinámica de abundancia
+
+## 7.1 Preparación de datos
+
+```{r, include=FALSE}
+# Abundancia relativa a nivel género
+asv_df_p = tax_glom(HMilkclean_filtered, taxrank = "Genus", NArm = FALSE)
+asv_df_prev = as.data.frame(otu_table(asv_df_p))
+
+taxa_info = as.data.frame(tax_table(asv_df_p))
+taxa_genus = taxa_info$Genus
+taxa_genus[is.na(taxa_genus)] = "unclassified"
+row.names(asv_df_prev) = make.unique(as.character(taxa_genus))
+asv_df_prev = as.data.frame(t(asv_df_prev))
+
+# Alinear con metadatos
+muestras_comunes = intersect(rownames(asv_df_prev), rownames(metadata))
+abundancia_df = asv_df_prev[muestras_comunes, ]
+metadata = metadata[muestras_comunes, ]
+
+abundancia_df = abundancia_df %>%
+  rownames_to_column(var = "id") %>%
+  mutate(type = case_when(
+    startsWith(id, "ML") ~ "Milk",
+    startsWith(id, "MH") ~ "Stool"
+  ))
+
+# Leches
+maas_leches = abundancia_df %>%
+  filter(type == "Milk") %>%
+  column_to_rownames(var = "id") %>%
+  select(where(is.numeric))
+
+# Heces
+maas_heces = abundancia_df %>%
+  filter(type == "Stool") %>%
+  column_to_rownames(var = "id") %>%
+  select(where(is.numeric))
+```
+
+## 7.2 Boxplots por tipo de parto
+
+```{r, include=FALSE}
+rel_leches = sweep(maas_leches, 1, rowSums(maas_leches), "/")
+largo_leches = rel_leches %>%
+  rownames_to_column(var = "id") %>%
+  pivot_longer(cols = -id, names_to = "Taxon", values_to = "Abundancia") %>%
+  left_join(metadata %>% rownames_to_column(var = "id") %>% select(id, b_type), by = "id") %>%
+  filter(!is.na(b_type))
+
+top10_milk = largo_leches %>%
+  group_by(Taxon) %>%
+  summarise(media = mean(Abundancia), .groups = "drop") %>%
+  arrange(desc(media)) %>%
+  slice_head(n = 10) %>%
+  pull(Taxon)
+
+rel_heces = sweep(maas_heces, 1, rowSums(maas_heces), "/")
+largo_heces = rel_heces %>%
+  rownames_to_column(var = "id") %>%
+  pivot_longer(cols = -id, names_to = "Taxon", values_to = "Abundancia") %>%
+  left_join(metadata %>% rownames_to_column(var = "id") %>% select(id, b_type), by = "id") %>%
+  filter(!is.na(b_type))
+
+top10_heces = largo_heces %>%
+  group_by(Taxon) %>%
+  summarise(media = mean(Abundancia), .groups = "drop") %>%
+  arrange(desc(media)) %>%
+  slice_head(n = 10) %>%
+  pull(Taxon)
+```
+
+**Figura 8:** *Top 10 taxones en leches por tipo de parto*
+
+```{r}
+largo_leches %>%
+  filter(Taxon %in% top10_milk) %>%
+  mutate(Log_Abundancia = log10(Abundancia + 1e-5) + 5) %>%
+  ggplot(aes(x = reorder(Taxon, -Log_Abundancia, FUN = median),
+             y = Log_Abundancia, fill = b_type)) +
+  geom_boxplot(outlier.alpha = 0.4, outlier.shape = 16, outlier.size = 1.5) +
+  scale_fill_manual(values = c("Vaginal" = "#D4A2C3", "Cesarean" = "#2A5783")) +
+  stat_compare_means(aes(group = b_type), label = "p.signif", hide.ns = TRUE) +
+  labs(x = "Taxon", y = "Relative Abundance (Log10)", fill = "Birth Type") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic", color = "black"),
+    axis.text.y = element_text(color = "black"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+**Figura 9:** *Top 10 taxones en heces por tipo de parto*
+
+```{r}
+largo_heces %>%
+  filter(Taxon %in% top10_heces) %>%
+  mutate(Log_Abundancia = log10(Abundancia + 1e-5) + 5) %>%
+  ggplot(aes(x = reorder(Taxon, -Log_Abundancia, FUN = median),
+             y = Log_Abundancia, fill = b_type)) +
+  geom_boxplot(outlier.alpha = 0.4, outlier.shape = 16, outlier.size = 1.5) +
+  scale_fill_manual(values = c("Vaginal" = "#D4A2C3", "Cesarean" = "#2A5783")) +
+  stat_compare_means(aes(group = b_type), label = "p.signif", hide.ns = TRUE) +
+  labs(x = "Taxon", y = "Relative Abundance (Log10)", fill = "Birth Type") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic", color = "black"),
+    axis.text.y = element_text(color = "black"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+## 7.3 Áreas por tiempo y tipo de parto
+
+```{r, include=FALSE}
+largo_heces = largo_heces %>%
+  mutate(time = case_when(
+    endsWith(id, "-I")   ~ "I",
+    endsWith(id, "-II")  ~ "II",
+    endsWith(id, "-III") ~ "III"
+  ))
+
+top15_taxones_h = largo_heces %>%
+  group_by(Taxon) %>%
+  summarise(Media = mean(Abundancia), .groups = "drop") %>%
+  arrange(desc(Media)) %>%
+  slice_head(n = 15) %>%
+  pull(Taxon)
+
+datos_areas_h = largo_heces %>%
+  mutate(Taxon_Top = if_else(Taxon %in% top15_taxones_h, Taxon, "Other")) %>%
+  mutate(time_num = case_when(time == "I" ~ 1, time == "II" ~ 2, time == "III" ~ 3)) %>%
+  group_by(id, time_num, b_type, Taxon_Top) %>%
+  summarise(Abundancia_Paciente = sum(Abundancia), .groups = "drop") %>%
+  group_by(time_num, b_type, Taxon_Top) %>%
+  summarise(Abundancia_Promedio = mean(Abundancia_Paciente), .groups = "drop") %>%
+  mutate(Taxon_Top = factor(Taxon_Top, levels = c("Other", top15_taxones_h)))
+
+largo_leches = largo_leches %>%
+  mutate(time = case_when(
+    endsWith(id, "-I")   ~ "I",
+    endsWith(id, "-II")  ~ "II",
+    endsWith(id, "-III") ~ "III"
+  ))
+
+top15_taxones_l = largo_leches %>%
+  group_by(Taxon) %>%
+  summarise(Media = mean(Abundancia), .groups = "drop") %>%
+  arrange(desc(Media)) %>%
+  slice_head(n = 15) %>%
+  pull(Taxon)
+
+datos_areas_l = largo_leches %>%
+  mutate(Taxon_Top = if_else(Taxon %in% top15_taxones_l, Taxon, "Other")) %>%
+  mutate(time_num = case_when(time == "I" ~ 1, time == "II" ~ 2, time == "III" ~ 3)) %>%
+  group_by(id, time_num, b_type, Taxon_Top) %>%
+  summarise(Abundancia_Paciente = sum(Abundancia), .groups = "drop") %>%
+  group_by(time_num, b_type, Taxon_Top) %>%
+  summarise(Abundancia_Promedio = mean(Abundancia_Paciente), .groups = "drop") %>%
+  mutate(Taxon_Top = factor(Taxon_Top, levels = c("Other", top15_taxones_l)))
+```
+
+**Figura 10:** *Dinámica del microbioma en heces a través del tiempo*
+
+```{r}
+ggplot(datos_areas_h, aes(x = time_num, y = Abundancia_Promedio, fill = Taxon_Top)) +
+  geom_area(alpha = 0.85, color = "white", linewidth = 0.2) +
+  scale_x_continuous(breaks = c(1, 2, 3), labels = c("I", "II", "III")) +
+  facet_wrap(~ b_type) +
+  labs(x = "Time", y = "Average Relative Abundance", fill = "Taxon") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "right",
+    legend.text = element_text(face = "italic", size = 9),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_fill_manual(values = mis_rds)
+```
+
+**Figura 11:** *Dinámica del microbioma en leches a través del tiempo*
+
+```{r}
+ggplot(datos_areas_l, aes(x = time_num, y = Abundancia_Promedio, fill = Taxon_Top)) +
+  geom_area(alpha = 0.85, color = "white", linewidth = 0.2) +
+  scale_x_continuous(breaks = c(1, 2, 3), labels = c("I", "II", "III")) +
+  facet_wrap(~ b_type) +
+  labs(x = "Time", y = "Average Relative Abundance", fill = "Taxon") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "right",
+    legend.text = element_text(face = "italic", size = 9),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_fill_manual(values = mis_rds)
+```
+
+## 7.4 Microorganismos específicos
+
+```{r, include=FALSE}
+plot_microbe_abundance = function(microbe_name, data) {
+  pd = position_dodge(width = 0.15)
+  
+  data %>%
+    filter(Taxon == microbe_name) %>%
+    ggplot(aes(x = time, y = Abundancia, color = b_type,
+               fill = b_type, linetype = b_type, group = b_type)) +
+    stat_summary(fun = median, geom = "line", size = 1, position = pd) +
+    stat_summary(
+      fun.max = ~quantile(., 0.75),
+      fun.min = ~quantile(., 0.25),
+      fun = median,
+      geom = "pointrange",
+      size = 0.8,
+      position = pd
+    ) +
+    labs(
+      title = paste(microbe_name),
+      fill = "Type of birth",
+      linetype = "Type of birth",
+      color = "Type of birth",
+      x = "Time",
+      y = "Relative Abundance"
+    ) +
+    theme_minimal() +
+    scale_x_discrete(limits = c("I", "II", "III")) +
+    theme(
+      plot.title = element_text(face = "italic", size = 14, hjust = 0.5),
+      legend.position = "bottom"
+    )
+}
+
+# Leches
+g2.1 = plot_microbe_abundance("Sphingomonas", largo_leches)
+g2.2 = plot_microbe_abundance("Streptococcus", largo_leches)
+g2.3 = plot_microbe_abundance("Staphylococcus", largo_leches)
+g2.4 = plot_microbe_abundance("Rothia", largo_leches)
+
+# Heces
+g2.5 = plot_microbe_abundance("Escherichia", largo_heces)
+g2.6 = plot_microbe_abundance("Bifidobacterium", largo_heces)
+g2.7 = plot_microbe_abundance("Veillonella", largo_heces)
+g2.8 = plot_microbe_abundance("Bacteroides", largo_heces)
+```
+
+**Figura 12:** *Interacción tipo de parto × tiempo en leches*
+
+```{r, fig.height=6, fig.width=10, message=FALSE}
+(g2.1 + g2.2) /
+(g2.3 + g2.4) +
+  plot_layout(guides = "collect")
+```
+
+**Figura 13:** *Interacción tipo de parto × tiempo en heces*
+
+```{r, fig.height=6, fig.width=10, message=FALSE}
+(g2.5 + g2.6) /
+(g2.7 + g2.8) +
+  plot_layout(guides = "collect")
+```
+
+# 8. Concordancia díada
+
+Se evalúa si la microbiota de la leche materna de una madre se asemeja
+más a la de su propio hijo que a la de otros (análisis intra vs. inter
+díada).
+
+## 8.1 Similitud Bray-Curtis
+
+```{r, include=FALSE}
+HMilk_rel = transform_sample_counts(HMilk_clean_genus, function(x) x / sum(x))
+
+meta = as(sample_data(HMilk_rel), "data.frame") %>%
+  rownames_to_column("sample_id")
+
+valid_dyads = meta %>%
+  filter(type %in% c("Milk", "Stool")) %>%
+  group_by(samp_n, p_code) %>%
+  summarise(n_types = n_distinct(type), .groups = "drop") %>%
+  filter(n_types == 2)
+
+calc_dyad_summary = function(ps_obj, time_point, metric = "bray") {
+  dyads_t = valid_dyads %>%
+    filter(samp_n == time_point) %>%
+    pull(p_code)
+  
+  meta_t = meta %>%
+    filter(samp_n == time_point, p_code %in% dyads_t, type %in% c("Milk", "Stool"))
+  
+  ps_sub = prune_samples(meta_t$sample_id, ps_obj)
+  
+  dist_mat = as.matrix(phyloseq::distance(ps_sub, method = metric))
+  sim_mat = 1 - dist_mat
+  
+  milk_samps = meta_t %>% filter(type == "Milk") %>% arrange(p_code)
+  stool_samps = meta_t %>% filter(type == "Stool") %>% arrange(p_code)
+  
+  common_p = sort(intersect(milk_samps$p_code, stool_samps$p_code))
+  milk_samps = milk_samps %>% filter(p_code %in% common_p)
+  stool_samps = stool_samps %>% filter(p_code %in% common_p)
+  
+  sub_sim = sim_mat[milk_samps$sample_id, stool_samps$sample_id]
+  rownames(sub_sim) = common_p
+  colnames(sub_sim) = common_p
+  
+  res_dyad = purrr::map_dfr(common_p, function(id) {
+    sim_intra = sub_sim[id, id]
+    sim_inter_avg = mean(sub_sim[id, colnames(sub_sim) != id])
+    
+    tibble(
+      p_code = id,
+      time = time_point,
+      sim_intra = sim_intra,
+      sim_inter_avg = sim_inter_avg,
+      diff = sim_intra - sim_inter_avg
+    )
+  })
+  
+  return(res_dyad)
+}
+
+times = sort(unique(valid_dyads$samp_n))
+dyad_paired_df = purrr::map_dfr(times, ~calc_dyad_summary(HMilk_rel, time_point = .x, metric = "bray"))
+
+test_results_paired = dyad_paired_df %>%
+  group_by(time) %>%
+  summarise(
+    n_dyads = n(),
+    mean_diff = mean(diff),
+    median_diff = median(diff),
+    p_value = wilcox.test(sim_intra, sim_inter_avg, paired = TRUE, alternative = "greater")$p.value,
+    .groups = "drop"
+  )
+```
+
+$H_0: \Delta_i = S_{\text{intra}, i} - \bar{S}_{\text{inter}, i} = 0$
+
+$H_1: \Delta_i = S_{\text{intra}, i} - \bar{S}_{\text{inter}, i} > 0$
+
+No hay suficiente evidencia para rechazar la hipótesis nula de que la
+relación de microorganismos de una madre se asocia de igual manera a los
+de otras observaciones ($\alpha = 0.05$).
+
+```{r}
+cbind(test_results_paired[, 1], round(test_results_paired[, 2:5], 4)) %>%
+  gt()
+```
+
+## 8.2 Jaccard y conteo compartido
+
+```{r, include=FALSE}
+calc_qualitative_overlap = function(ps_obj, time_point) {
+  dyads_t = valid_dyads %>%
+    filter(samp_n == time_point) %>%
+    pull(p_code)
+  
+  meta_t = meta %>%
+    filter(samp_n == time_point, p_code %in% dyads_t, type %in% c("Milk", "Stool"))
+  
+  ps_sub = prune_samples(meta_t$sample_id, ps_obj)
+  
+  otu_tab = as(otu_table(ps_sub), "matrix")
+  if (!taxa_are_rows(ps_sub)) otu_tab = t(otu_tab)
+  otu_bin = (otu_tab > 0) * 1
+  
+  milk_meta = meta_t %>% filter(type == "Milk") %>% arrange(p_code)
+  stool_meta = meta_t %>% filter(type == "Stool") %>% arrange(p_code)
+  
+  common_p = sort(intersect(milk_meta$p_code, stool_meta$p_code))
+  milk_meta = milk_meta %>% filter(p_code %in% common_p)
+  stool_meta = stool_meta %>% filter(p_code %in% common_p)
+  
+  milk_mat = otu_bin[, milk_meta$sample_id]
+  stool_mat = otu_bin[, stool_meta$sample_id]
+  colnames(milk_mat) = milk_meta$p_code
+  colnames(stool_mat) = stool_meta$p_code
+  
+  shared_counts = t(milk_mat) %*% stool_mat
+  
+  milk_totals = colSums(milk_mat)
+  stool_totals = colSums(stool_mat)
+  
+  union_mat = outer(milk_totals, stool_totals, "+") - shared_counts
+  jaccard_mat = shared_counts / union_mat
+  
+  res = purrr::map_dfr(common_p, function(id) {
+    count_intra = shared_counts[id, id]
+    count_inter_avg = mean(shared_counts[id, colnames(shared_counts) != id])
+    jaccard_intra = jaccard_mat[id, id]
+    jaccard_inter_avg = mean(jaccard_mat[id, colnames(jaccard_mat) != id])
+    
+    tibble(
+      p_code = id,
+      time = time_point,
+      count_intra = count_intra,
+      count_inter_avg = count_inter_avg,
+      count_diff = count_intra - count_inter_avg,
+      jaccard_intra = jaccard_intra,
+      jaccard_inter_avg = jaccard_inter_avg,
+      jaccard_diff = jaccard_intra - jaccard_inter_avg
+    )
+  })
+  
+  return(res)
+}
+
+qual_results = purrr::map_dfr(times, ~calc_qualitative_overlap(HMilk_clean_genus, time_point = .x))
+
+qual_summary = qual_results %>%
+  group_by(time) %>%
+  summarise(
+    n_dyads = n(),
+    median_count_intra = median(count_intra),
+    median_count_inter = median(count_inter_avg),
+    mean_count_diff = mean(count_diff),
+    p_val_count = wilcox.test(count_intra, count_inter_avg, paired = TRUE, alternative = "greater")$p.value,
+    median_jaccard_diff = median(jaccard_diff),
+    p_val_jaccard = wilcox.test(jaccard_intra, jaccard_inter_avg, paired = TRUE, alternative = "greater")$p.value,
+    .groups = "drop"
+  )
+```
+
+Evaluado mediante distancias composicionales (Bray-Curtis), similitud
+cualitativa (Jaccard) y conteo pareado de taxones compartidos, no se
+observó una concordancia comunitaria intra-díada significativamente mayor
+que la esperada por el azar poblacional (todas las $p > 0.10$).
+
+```{r}
+cbind(qual_summary[, 1], round(qual_summary[, 2:8], 4)) %>%
+  gt()
+```
+
+# 9. Taxones compartidos entre compartimentos
+
+Se evalúa la sobreposición de géneros entre la leche materna y las
+heces del infante, de forma global (Venn) y por tiempo (upset plot),
+siguiendo el diseño de la Figura 1 de referencia.
+
+## 9.1 Preparación de datos (presencia de géneros)
+
+```{r shared_prep, include=FALSE}
+# Matriz género x muestra a partir del objeto a nivel género
+otu_g = as(otu_table(HMilk_clean_genus), "matrix")
+if (!taxa_are_rows(HMilk_clean_genus)) otu_g = t(otu_g)
+# filas = géneros, columnas = muestras
+
+sd = sample_data(HMilk_clean_genus)
+comp = sd$type      # "Milk" / "Stool"
+time = sd$samp_n    # "I" / "II" / "III"
+
+# Presencia binaria (género presente si tiene >= 1 lectura)
+otu_bin = (otu_g > 0) * 1
+
+# Generos presentes por compartimento (cualquier muestra)
+generos_milk  = rownames(otu_bin)[rowSums(otu_bin[, comp == "Milk",  drop = FALSE]) > 0]
+generos_stool = rownames(otu_bin)[rowSums(otu_bin[, comp == "Stool", drop = FALSE]) > 0]
+
+# Generos presentes por compartimento x tiempo (sets para el upset)
+sets = list()
+for (c in c("Milk", "Stool")) {
+  for (t in c("I", "II", "III")) {
+    idx = which(comp == c & time == t)
+    if (length(idx) > 0) {
+      sets[[paste0(c, "_", t)]] = rownames(otu_bin)[rowSums(otu_bin[, idx, drop = FALSE]) > 0]
+    }
+  }
+}
+sets = sets[lengths(sets) > 0]
+
+cat("Géneros en Leche:", length(generos_milk), "\n")
+cat("Géneros en Heces: ", length(generos_stool), "\n")
+cat("Compartidos:      ", length(intersect(generos_milk, generos_stool)), "\n")
+```
+
+## 9.2 Venn diagrama (Leche vs. Heces)
+
+```{r}
+timepoints_ordered = c(
+  "Milk_I", "Milk_II", "Milk_III",
+  "Stool_I", "Stool_II", "Stool_III"
+)
+
+col_milk  = "#2985CC"  # Celeste / Leche
+col_stool = "#A294F3"  # Naranja / Heces infante
+
+colores_sets = c(
+  rep(col_milk, 3),    # Milk I, II, III
+  rep(col_stool, 3)    # Stool I, II, III
+)
+
+df_upset = as.data.frame(UpSetR::fromList(sets))
+
+upset_res = upset(
+  df_upset,
+  sets = rev(timepoints_ordered),
+  keep.order = TRUE,
+  order.by = "freq",
+  decreasing = TRUE,
+  nintersects = 40,
+  main.bar.color = "#104E8E",
+  sets.bar.color = rev(colores_sets),
+  matrix.color = "grey20",
+  show.numbers = "yes",
+  number.angles = 0,
+  mainbar.y.label = "N.º de géneros (Intersección)",
+  sets.x.label = "Total por condición",
+  text.scale = c(1.3, 1.1, 1, 1, 1.2, 0.95),
+  mb.ratio = c(0.55, 0.45)
+)
+
+
+ruta_upset_svg = file.path(fig_dir, "upset.svg")
+
+svglite::svglite(ruta_upset_svg, width = 12, height = 8)
+print(upset_res)
+dev.off()
+```
+
+
+```{r shared_venn, include=FALSE}
+venn_list = list(
+  "Leche" = generos_milk,
+  "Heces" = generos_stool
+)
+
+venn_res = venn.diagram(
+  x = venn_list,
+  filename = NULL,
+  col = "transparent",
+  fill = c(col_milk, col_stool),
+  alpha = 0.65,
+  cex = 1.0,
+  fontfamily = "sans",
+  cat.cex = 1.1,
+  cat.fontfamily = "sans",
+  cat.pos = c(-20, 20),
+  cat.dist = c(0.05, 0.05),
+  margin = 0.05
+)
+
+ruta_venn_svg = file.path(fig_dir, "venn.svg")
+
+svglite::svglite(ruta_venn_svg, width = 12, height = 8)
+print(venn_res)
+dev.off()
+```
+
+
