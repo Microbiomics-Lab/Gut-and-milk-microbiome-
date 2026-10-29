@@ -20,10 +20,17 @@ knitr::opts_chunk$set(
   fig.height = 6
 )
 
-fig_dir <- Sys.getenv("PIPELINE_FIGDIR", unset = "")
+fig_dir = Sys.getenv("PIPELINE_FIGDIR", unset = "")
+
 if (nzchar(fig_dir)) {
+  fig_path_knitr = paste0(normalizePath(fig_dir, winslash = "/", mustWork = FALSE), "/")
+  
   dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
-  knitr::opts_chunk$set(fig.path = fig_dir)
+  knitr::opts_chunk$set(
+    fig.path = fig_path_knitr,
+    dev = "png",
+    dpi = 300
+  )
 }
 ```
 
