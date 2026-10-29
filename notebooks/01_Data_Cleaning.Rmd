@@ -1,0 +1,450 @@
+---
+title: "01 - Data Cleaning"
+author: "Esteven Aragón"
+date: "2025-09-27"
+output:
+  word_document:
+    toc: true
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+
+fig_dir <- Sys.getenv("PIPELINE_FIGDIR", unset = "")
+if (nzchar(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+  knitr::opts_chunk$set(fig.path = fig_dir)
+}
+```
+
+# 1. Configuración
+
+## 1.1 Librerías
+
+```{r libraries, include=FALSE}
+pacman::p_load(
+  phyloseq, qiime2R, vegan,
+  zCompositions,
+  ggplot2, rmarkdown, knitr,
+  tibble, tidyr, stringr, rlang, dplyr
+)
+```
+
+## 1.2 Rutas y constantes
+
+```{r paths, include=FALSE}
+gen_path  = getwd()
+gen_path  = gsub("notebooks", "", gen_path)
+data_path = paste0(gen_path, "Data")
+raw_path  = paste0(data_path, "/raw")
+proc_path = paste0(data_path, "/processed")
+
+if (!dir.exists(proc_path)) dir.create(proc_path, recursive = TRUE)
+
+env_or <- function(var, default) {
+  v <- Sys.getenv(var, unset = "")
+  if (nzchar(v)) v else default
+}
+
+metadata_path = env_or("PIPELINE_METADATA", paste0(raw_path, "/Metadata.csv"))
+taxonomy_path = env_or("PIPELINE_TAXONOMY", paste0(raw_path, "/taxonomy-gg2.qza"))
+table_path    = env_or("PIPELINE_TABLE",    paste0(raw_path, "/table-final-clean.qza"))
+
+cat("Metadata :", metadata_path, "\n")
+cat("Taxonomy :", taxonomy_path, "\n")
+cat("Table    :", table_path, "\n")
+
+cont_vars = c("gest_week", "b_bh", "g_index")
+
+'%nin%' = Negate("%in%")
+
+del_user = c("MB-059", "MB-061", "MB-055", "MB-001", "MB-005")
+```
+
+# 2. Carga y filtrado de metadatos
+
+## 2.1 Carga inicial
+
+```{r load_metadata, include=FALSE}
+df = read.csv(metadata_path, sep = ";")
+cat("Observaciones iniciales:", nrow(df), "\n")
+cat("Individuos únicos:", length(unique(df$p_code)), "\n")
+```
+
+## 2.2 Exclusión de individuos
+
+Se excluyen 5 individuos que no cumplían con los requisitos del estudio:
+
+| ID Individuo |
+|--------------|
+| MB-059       |
+| MB-061       |
+| MB-055       |
+| MB-001       |
+| MB-005       |
+
+```{r exclude_users, include=FALSE}
+df = df[df$p_code %nin% del_user, ]
+cat("Observaciones tras exclusión:", nrow(df), "\n")
+```
+
+## 2.3 Filtro de observaciones repetidas
+
+Se retienen solo aquellos individuos con 2 o 3 muestreos:
+
+```{r filter_repeats, include=FALSE}
+df = df %>%
+  group_by(p_code) %>%
+  filter(n() %in% c(2, 3)) %>%
+  ungroup()
+
+cat("Observaciones finales:", nrow(df), "\n")
+cat("Individuos finales:", length(unique(df$p_code)), "\n")
+
+count_user = table(df$p_code)
+cat("  - Con 2 tiempos:", sum(count_user == 2), "\n")
+cat("  - Con 3 tiempos:", sum(count_user == 3), "\n")
+```
+
+## 2.4 Agregación Leche / Heces
+
+Cada individuo aporta dos tipos de muestra (Leche y Heces) por tiempo.
+Se duplica la metadata con el prefijo `ML` (leche) y `MH` (heces):
+
+```{r aggregate_milk_stool, include=FALSE}
+df1 = df
+df2 = df
+
+df1$sam_ = gsub("B", "L", df$p_code)  # Leche
+df2$sam_ = gsub("B", "H", df$p_code)  # Heces
+
+df3 = bind_rows(df1, df2)
+write.csv(df3, paste0(proc_path, "/Metadata_rep.csv"), row.names = FALSE)
+cat("Observaciones agregadas (Leche + Heces):", nrow(df3), "\n")
+```
+
+# 3. Carga de datos QIIME2
+
+```{r load_qiime2, include=FALSE}
+datos = qza_to_phyloseq(
+  features  = table_path,
+  taxonomy  = taxonomy_path
+)
+
+otu_table = data.frame(datos@otu_table)
+taxonomia = data.frame(datos@tax_table)
+
+cat("ASVs:", nrow(otu_table), "\n")
+cat("Muestras:", ncol(otu_table), "\n")
+```
+
+# 4. Limpieza taxonómica
+
+## 4.1 Ajuste de nombres de columnas
+
+```{r fix_column_names, include=FALSE}
+colnames(otu_table) = gsub(".heces", "", colnames(otu_table))
+```
+
+## 4.2 Filtro de Sphingomonas
+
+Se identifican las muestras con menos del 30% de *Sphingomonas*
+(efecto de contaminación en muestras de leche):
+
+```{r sphingomonas_filter, include=FALSE}
+# rownames(taxonomia) = taxonomia$X # Aquí las ocupé
+# taxonomia = taxonomia %>% select(-X)
+
+sphingo_otus = rownames(taxonomia)[startsWith(taxonomia$Genus, "Sphingomonas")]
+sphingo_otus = intersect(sphingo_otus, rownames(otu_table))
+
+abund_total   = colSums(otu_table)
+abund_sphingo = colSums(otu_table[sphingo_otus, , drop = FALSE])
+pct_sphingo   = 100 * abund_sphingo / abund_total
+
+muestras_validas = names(pct_sphingo)  # Todas pasan el filtro
+cat("Muestras tras filtro Sphingomonas:", length(muestras_validas), "\n")
+```
+
+## 4.3 Remoción de muestras Novogene
+
+Se eliminan 7 muestras procesadas fuera del laboratorio:
+
+```{r remove_novogene, include=FALSE}
+del_novogene = c(
+  "novogene.ML.006.III", "novogene.ML.006.II",
+  "novogene.ML.041.III", "novogene.ML.046.I",
+  "novogene.ML.050.III", "novogene.ML.064.III",
+  "X01sept2021_MH.042.III"
+)
+
+del_novogene_dots = gsub("-", ".", del_novogene, fixed = TRUE)
+otu_table = otu_table[, !colnames(otu_table) %in% del_novogene_dots, drop = FALSE]
+cat("Muestras tras remoción Novogene:", ncol(otu_table), "\n")
+```
+
+## 4.4 Agrupación a nivel de Género
+
+La clasificación taxonómica llega a nivel de especie. Se simplifica
+a nivel de género para el análisis:
+
+```{r tax_glom_genus, include=FALSE}
+# Limpiar nombres de género y familia (quitar sufijos de especie)
+taxonomia$Genus  = gsub("_.*", "", taxonomia$Genus)
+taxonomia$Genus  = gsub("\\..*", "", taxonomia$Genus)
+taxonomia$Family = gsub("_.*", "", taxonomia$Family)
+taxonomia$Family = gsub("\\..*", "", taxonomia$Family)
+
+otu_mat = as.matrix(otu_table)
+tax_mat = as.matrix(taxonomia)
+```
+
+# 5. Construcción del objeto phyloseq
+
+## 5.1 Alineación de metadatos
+
+```{r align_metadata, include=FALSE}
+metadata = read.csv(paste0(proc_path, "/Metadata_rep.csv"))
+metadata = metadata[metadata$p_code %nin% del_user, ]
+
+metadata$samp_n = ifelse(
+  metadata$samp_n == "1", "I",
+  ifelse(metadata$samp_n == "2", "II", "III")
+)
+
+metadata$sam_ = paste0(metadata$sam_, "-", metadata$samp_n)
+rownames(metadata) = metadata$sam_
+
+colnames(otu_mat) = gsub(".", "-", colnames(otu_mat), fixed = TRUE)
+
+metadata = metadata[rownames(metadata) %in% colnames(otu_mat), ]
+samples = sample_data(metadata)
+rownames(samples) = gsub("\\.", "-", rownames(samples))
+```
+
+## 5.2 Aplicar filtro Sphingomonas al phyloseq
+
+```{r apply_sphingo_filter, include=FALSE}
+muestras_menos_30 = gsub(".", "-", muestras_validas, fixed = TRUE)
+del_novogene_2    = gsub(".", "-", del_novogene, fixed = TRUE)
+muestras_menos_30 = muestras_menos_30[muestras_menos_30 %nin% del_novogene_2]
+
+samples = samples[rownames(samples) %in% muestras_menos_30, ]
+```
+
+## 5.3 Crear objeto phyloseq
+
+```{r create_phyloseq, include=FALSE}
+OTU = otu_table(otu_mat, taxa_are_rows = TRUE)
+TAX = tax_table(tax_mat)
+
+OTU = OTU[, colnames(OTU) %in% rownames(samples), drop = FALSE]
+
+HMilk_clean = phyloseq(OTU, samples, TAX)
+cat("Muestras en phyloseq:", nsamples(HMilk_clean), "\n")
+cat("Taxones en phyloseq:", ntaxa(HMilk_clean), "\n")
+```
+
+# 6. Filtros de calidad
+
+## 6.1 Remoción de muestras con cero lecturas
+
+```{r remove_zero_samples, include=FALSE}
+sumas_de_muestras = sample_sums(HMilk_clean)
+nombres_muestras_cero = names(sumas_de_muestras[sumas_de_muestras == 0])
+
+if (length(nombres_muestras_cero) > 0) {
+  cat("Muestras con cero lecturas:", length(nombres_muestras_cero), "\n")
+  HMilk_clean = prune_samples(sample_sums(HMilk_clean) > 0, HMilk_clean)
+} else {
+  cat("No se detectaron muestras con cero lecturas.\n")
+}
+```
+
+## 6.2 Remoción de ASVs con cero lecturas
+
+```{r remove_zero_taxa, include=FALSE}
+n_asv_ceros = sum(taxa_sums(HMilk_clean) == 0)
+cat("ASVs con cero lecturas:", n_asv_ceros, "\n")
+
+HMilk_clean = prune_taxa(taxa_sums(HMilk_clean) > 0, HMilk_clean)
+cat("Taxones restantes:", ntaxa(HMilk_clean), "\n")
+```
+
+## 6.3 Filtro de prevalencia mínima (5%)
+
+Se eliminan taxones que aparecen en menos del 5% de las muestras
+de cada tipo (Leche / Heces) por separado:
+
+```{r prevalence_filter, include=FALSE}
+filter_phyloseq_by_prevalence = function(physeq, min_prevalence = 0.05) {
+  prevalence = apply(
+    X = otu_table(physeq),
+    MARGIN = ifelse(taxa_are_rows(physeq), 1, 2),
+    FUN = function(x) sum(x > 0)
+  )
+  prevalence_ratio = prevalence / nsamples(physeq)
+  physeq_filtered  = prune_taxa(prevalence_ratio >= min_prevalence, physeq)
+  
+  cat("  Taxones originales:", ntaxa(physeq), "\n")
+  cat("  Taxones restantes:", ntaxa(physeq_filtered), "\n")
+  cat("  Eliminados:", ntaxa(physeq) - ntaxa(physeq_filtered), "\n")
+  
+  return(physeq_filtered)
+}
+
+sample_data(HMilk_clean)$type = ifelse(
+  startsWith(sample_data(HMilk_clean)$sam_, "ML-"), "Milk", "Stool"
+)
+
+HMilk_genus = tax_glom(HMilk_clean, taxrank = "Genus", NArm = FALSE)
+
+cat("Filtro de prevalencia - Leches:\n")
+HMilk_filtered_milk = filter_phyloseq_by_prevalence(
+  subset_samples(HMilk_genus, type == "Milk"), min_prevalence = 0.05
+)
+
+cat("Filtro de prevalencia - Heces:\n")
+HMilk_filtered_stool = filter_phyloseq_by_prevalence(
+  subset_samples(HMilk_genus, type == "Stool"), min_prevalence = 0.05
+)
+
+taxones_milk  = taxa_names(HMilk_filtered_milk)
+taxones_stool = taxa_names(HMilk_filtered_stool)
+taxones_validos = union(taxones_milk, taxones_stool)
+
+HMilkclean_filtered = prune_taxa(taxones_validos, HMilk_genus)
+cat("Taxones finales (unión Leche + Heces):", ntaxa(HMilkclean_filtered), "\n")
+```
+
+## 6.4 Rarefacción (solo para índices de diversidad)
+
+```{r rarefaction, include=FALSE}
+set.seed(999)
+HMS_rarefied = rarefy_even_depth(
+  HMilkclean_filtered,
+  sample.size = 10000,
+  rngseed = 999,
+  verbose = FALSE
+)
+cat("Rarefacción completada (size = 10,000).\n")
+```
+
+# 7. Paleta de colores por género
+
+Se genera una paleta donde cada familia tiene un color base y sus
+géneros derivan tonos más claros:
+
+```{r color_palette1, include=FALSE}
+n_top_familias = 15
+
+tax_df = as.data.frame(tax_table(HMilkclean_filtered))
+tax_df = tax_df %>% mutate(across(everything(), ~ gsub("_.*", "", .)))
+
+top_familias = tax_df %>%
+  dplyr::filter(!is.na(Family)) %>%
+  count(Family, sort = TRUE) %>%
+  slice_head(n = n_top_familias) %>%
+  pull(Family)
+
+tax_df
+```
+
+
+```{r color_palette2, include=FALSE}
+tax_rel = tax_df %>%
+  dplyr::select(Family, Genus) %>%
+  distinct() %>%
+  filter(!is.na(Family) & !is.na(Genus) & Genus != "unclassified") %>%
+  mutate(
+    Family_Group = ifelse(Family %in% top_familias, Family, "Other")
+  )
+
+set.seed(1234)
+colores_base = colorRampPalette(c(
+  "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+  "#A65628", "#F781BF", "#20B2AA", "#17BECF", "#BCBD22",
+  "#1A6876", "#249C72", "#7BC3AC", "#D8F7EF"
+))(n_top_familias)
+names(colores_base) = top_familias
+
+lista_colores_generos = list()
+
+for (fam in top_familias) {
+  generos_de_familia = tax_rel$Genus[tax_rel$Family_Group == fam]
+  n_generos = length(generos_de_familia)
+  color_fam = colores_base[fam]
+  
+  if (n_generos == 1) {
+    tonos = color_fam
+  } else {
+    paleta_grad = colorRampPalette(c(color_fam, "white"))
+    tonos = paleta_grad(n_generos + 2)[1:n_generos]
+  }
+  
+  names(tonos) = generos_de_familia
+  lista_colores_generos[[fam]] = tonos
+}
+
+generos_otros = tax_rel$Genus[tax_rel$Family_Group == "Other"]
+tonos_otros = rep("#D3D3D3", length(generos_otros))
+names(tonos_otros) = generos_otros
+lista_colores_generos[["Other"]] = tonos_otros
+
+vector_colores_final = unlist(lista_colores_generos)
+names(vector_colores_final) = sub("^.*\\.", "", names(vector_colores_final))
+
+other_vect = c("#D3D3D3", "#D3D3D3")
+names(other_vect) = c("Others", "Other")
+vector_colores_final = c(vector_colores_final, other_vect)
+
+saveRDS(vector_colores_final, file = paste0(data_path, "/paleta_colores_generos.rds"))
+cat("Paleta de colores guardada.\n")
+```
+
+# 8. Resumen del dataset limpio
+
+```{r summary, include=FALSE}
+cat("=== RESUMEN DEL DATASET LIMPIO ===\n")
+cat("Muestras:", nsamples(HMilkclean_filtered), "\n")
+cat("  - Leches:", sum(sample_data(HMilkclean_filtered)$type == "Milk"), "\n")
+cat("  - Heces:", sum(sample_data(HMilkclean_filtered)$type == "Stool"), "\n")
+cat("Taxones (Géneros):", ntaxa(HMilkclean_filtered), "\n")
+cat("Individuos:", length(unique(sample_data(HMilkclean_filtered)$p_code)), "\n")
+cat("\nProfundidad de secuenciación:\n")
+print(summary(sample_sums(HMilkclean_filtered)))
+```
+
+# 9. Guardado de objetos
+
+Se guardan los objetos limpios para que los archivos 02 y 03 los
+carguen de forma independiente:
+
+```{r save_objects, include=FALSE}
+saveRDS(HMilkclean_filtered, file = paste0(proc_path, "/HMilkclean_filtered.rds"))
+saveRDS(HMilk_genus, file = paste0(proc_path, "/HMilk_clean_genus.rds"))
+saveRDS(HMS_rarefied, file = paste0(proc_path, "/HMS_rarefied.rds"))
+saveRDS(metadata, file = paste0(proc_path, "/metadata_clean.rds"))
+saveRDS(df, file = paste0(proc_path, "/df_clean.rds"))
+saveRDS(otu_mat, file = paste0(proc_path, "/otu_raw.rds"))
+saveRDS(tax_mat, file = paste0(proc_path, "/tax_raw.rds"))
+
+cat("\nObjetos guardados en:", proc_path, "\n")
+cat("  - HMilkclean_filtered.rds\n")
+cat("  - HMS_rarefied.rds\n")
+cat("  - metadata_clean.rds\n")
+cat("  - df_clean.rds\n")
+cat("  - otu_raw.rds\n")
+cat("  - tax_raw.rds\n")
+cat("  - paleta_colores_generos.rds (en Data/)\n")
+```
